@@ -1,7 +1,7 @@
 {
   "name": "@cloudflare/computer",
   "private": true,
-  "packageManager": "npm",
+  "packageManager": "npm@10.9.4",
   "workspaces": [
     "packages/dofs",
     "packages/rpc",

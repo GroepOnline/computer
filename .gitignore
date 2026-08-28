@@ -17,3 +17,36 @@ packages/computer/src/backends/worker-shell/generated-bundle.ts
 # blanket dist/ rule above; listed here for discoverability.
 packages/computer-computerd-*/bin/computerd
 packages/computer/dist/bin/computerd-*
+
+# ChefGroep standard ignores (OS / Xcode / local env / CE)
+.compound-engineering/*.local.yaml
+
+# OS / editors
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Desktop.ini
+.idea/
+*.swp
+*.swo
+*~
+
+# Xcode / iOS
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.xcodeproj/
+*.xcworkspace/
+*.ipa
+*.dSYM
+*.dSYM.zip
+Pods/
+
+# Local env
+.env
+.env.local
+.env.*.local

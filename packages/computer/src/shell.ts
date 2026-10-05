@@ -21,7 +21,7 @@
 // whatever landed between reattach and drain.
 
 import type { ExecEvent, ShellRPC } from "@cloudflare/computer-rpc";
-import type { ApplyResult, SkippedEntry } from "@cloudflare/dofs";
+import type { ApplyResult, ChangeCursor, SkippedEntry } from "@cloudflare/dofs";
 
 import { noopObserver, safeErrorMessage, type WorkspaceObserver, withSpan } from "./observe.js";
 import { assertNotTemplate } from "./sh.js";
@@ -39,7 +39,15 @@ export type WorkspaceExecEvent<E extends ExecEncoding = undefined> =
 
 export type ExecSyncResult =
   | { status: "complete"; applied: number; skipped: SkippedEntry[] }
-  | { status: "pending"; applied: number; skipped: SkippedEntry[]; error: string };
+  | {
+      status: "pending";
+      applied: number;
+      skipped: SkippedEntry[];
+      error?: string;
+      backend?: string;
+      runtimeId?: string;
+      targetCursor?: ChangeCursor;
+    };
 
 export type KillSignal = "SIGTERM" | "SIGKILL" | "SIGINT" | "SIGHUP";
 
@@ -49,6 +57,7 @@ export type KillSignal = "SIGTERM" | "SIGKILL" | "SIGINT" | "SIGHUP";
 // reaches its end, carrying the post-drain pull result.
 export interface CommandExecution {
   id: string;
+  runtimeId?: string;
   events: ReadableStream<ExecEvent>;
   sync: { pushed: number; outcome: Promise<PostPullOutcome> };
 }
@@ -72,6 +81,7 @@ export interface ExecOptions {
   // Standard input fed to the command. Bytes, or a string encoded
   // as UTF-8.
   stdin?: Uint8Array | string;
+  sync?: "wait" | "defer";
 }
 
 export interface GetExecOptions {
@@ -79,6 +89,9 @@ export interface GetExecOptions {
   // number resumes from that seq+1. Omit to receive every
   // event from the start of the run (replays the whole log).
   resume?: "tail" | "full" | number;
+  // Expected process identity for process-local replay. Internal to
+  // the Workspace command adapter; direct ShellRPC callers omit it.
+  runtimeId?: string;
 }
 
 // Push/pull bracket plumbing. CommandExecutor doesn't know about
@@ -90,65 +103,90 @@ export interface GetExecOptions {
 // skipped read-only entries on the sync outcome.
 export interface Sync {
   push(): Promise<number>;
-  pull(): Promise<ApplyResult>;
-  onPullPending?(error: unknown): Promise<void>;
+  pull(runtimeId?: string): Promise<ApplyResult>;
+  onPullPending?(error: unknown, runtimeId?: string): Promise<void>;
+  onPostExecPending?(runtimeId?: string): Promise<{
+    backend?: string;
+    runtimeId?: string;
+    targetCursor?: ChangeCursor;
+  }>;
 }
+
+type ShellExecInput = Parameters<ShellRPC["exec"]>[0];
+type ShellGetInput = Parameters<ShellRPC["getExec"]>[0] & { runtimeId?: string };
+type ShellExecEnvelope = Awaited<ReturnType<ShellRPC["exec"]>> & { runtimeId?: string };
+
+// Optional host-owned dispatch boundary. The container Workspace uses
+// this to keep its pre-exec push and shell spawn on one backend handle;
+// simpler executors use Sync.push followed by the supplied ShellRPC.
+export interface CommandDispatchResult {
+  pushed: number;
+  envelope: ShellExecEnvelope;
+}
+
+export type CommandDispatch = (input: ShellExecInput) => Promise<CommandDispatchResult>;
+export type CommandGetDispatch = (input: ShellGetInput) => Promise<ShellExecEnvelope>;
 
 export class CommandExecutor {
   readonly #shell: ShellRPC;
   readonly #sync: Sync;
   readonly #observer: WorkspaceObserver;
+  readonly #dispatch: CommandDispatch | undefined;
+  readonly #getDispatch: CommandGetDispatch | undefined;
 
-  constructor(shell: ShellRPC, sync: Sync, observer: WorkspaceObserver = noopObserver) {
+  constructor(
+    shell: ShellRPC,
+    sync: Sync,
+    observer: WorkspaceObserver = noopObserver,
+    dispatch?: CommandDispatch,
+    getDispatch?: CommandGetDispatch,
+  ) {
     this.#shell = shell;
     this.#sync = sync;
     this.#observer = observer;
+    this.#dispatch = dispatch;
+    this.#getDispatch = getDispatch;
   }
 
   // Spawn a command. Pushes host-side writes first so the command
   // sees them, then returns the raw event stream and the sync
-  // bracket stats. The push failure is non-fatal per docs/05 — the
-  // command still runs and pushed reports 0.
+  // bracket stats. A failed push aborts before shell.exec: running
+  // with stale or incomplete workspace contents is not safe.
   async exec(source: string, options: ExecOptions = {}): Promise<CommandExecution> {
     assertNotTemplate(source);
-    let pushed = 0;
-    try {
+    const input: ShellExecInput = {
+      source,
+      id: options.id,
+      cwd: options.cwd,
+      timeoutMs: options.timeoutMs,
+      env: options.env,
+      stdin:
+        typeof options.stdin === "string" ? new TextEncoder().encode(options.stdin) : options.stdin,
+    };
+    let pushed: number;
+    let envelope: ShellExecEnvelope;
+    if (this.#dispatch !== undefined) {
+      ({ pushed, envelope } = await this.#dispatch(input));
+    } else {
       pushed = await this.#sync.push();
-    } catch {
-      // pushed stays 0
+      envelope = await spawnShell(this.#shell, input, this.#observer);
     }
-    const envelope = await withSpan(
-      this.#observer,
-      "workspace.runtime.exec.spawn",
-      {
-        "workspace.runtime.cwd": options.cwd,
-        "workspace.runtime.timeout_ms": options.timeoutMs,
-        "workspace.runtime.id": options.id,
-      },
-      () =>
-        this.#shell.exec({
-          source,
-          id: options.id,
-          cwd: options.cwd,
-          timeoutMs: options.timeoutMs,
-          env: options.env,
-          stdin:
-            typeof options.stdin === "string"
-              ? new TextEncoder().encode(options.stdin)
-              : options.stdin,
-        }),
-      (span, outcome) => {
-        if (outcome.ok) span.setAttribute("workspace.runtime.id", outcome.value.id);
-      },
-    );
     // Dispose the RPC envelope when the event stream finishes
     // draining. Without this, capnweb's exports table holds onto
     // the envelope for the life of the session — one entry per exec
     // call — because the inner stream is handed off to the caller
     // and the envelope can't be bound with `using` here.
     const drained = disposeOnDone(envelope.events, () => maybeDispose(envelope));
-    const { stream, outcome } = withPostPull(drained, this.#sync);
-    return { id: envelope.id, events: stream, sync: { pushed, outcome } };
+    const wrapped =
+      options.sync === "defer"
+        ? withDeferredPostPull(drained, this.#sync, envelope.runtimeId)
+        : withPostPull(drained, this.#sync, envelope.runtimeId);
+    return {
+      id: envelope.id,
+      runtimeId: envelope.runtimeId,
+      events: wrapped.stream,
+      sync: { pushed, outcome: wrapped.outcome },
+    };
   }
 
   // Reattach to an in-flight or recently-completed exec. Reattach
@@ -157,10 +195,13 @@ export class CommandExecutor {
   // reattach and drain.
   async get(id: string, options: GetExecOptions = {}): Promise<CommandExecution> {
     const after = resumeToAfter(options.resume);
-    const envelope = await this.#shell.getExec({ id, after });
+    const envelope: ShellExecEnvelope =
+      this.#getDispatch === undefined
+        ? await this.#shell.getExec({ id, after })
+        : await this.#getDispatch({ id, after, runtimeId: options.runtimeId });
     const drained = disposeOnDone(envelope.events, () => maybeDispose(envelope));
-    const { stream, outcome } = withPostPull(drained, this.#sync);
-    return { id, events: stream, sync: { pushed: 0, outcome } };
+    const { stream, outcome } = withPostPull(drained, this.#sync, envelope.runtimeId);
+    return { id, runtimeId: envelope.runtimeId, events: stream, sync: { pushed: 0, outcome } };
   }
 
   kill(id: string, signal?: KillSignal): Promise<void> {
@@ -170,6 +211,26 @@ export class CommandExecutor {
   dispose(id: string): Promise<void> {
     return this.#shell.disposeExec({ id });
   }
+}
+
+export function spawnShell(
+  shell: ShellRPC,
+  input: ShellExecInput,
+  observer: WorkspaceObserver = noopObserver,
+): Promise<ShellExecEnvelope> {
+  return withSpan(
+    observer,
+    "workspace.runtime.exec.spawn",
+    {
+      "workspace.runtime.cwd": input.cwd,
+      "workspace.runtime.timeout_ms": input.timeoutMs,
+      "workspace.runtime.id": input.id,
+    },
+    () => shell.exec(input),
+    (span, outcome) => {
+      if (outcome.ok) span.setAttribute("workspace.runtime.id", outcome.value.id);
+    },
+  );
 }
 
 function resumeToAfter(resume: "tail" | "full" | number | undefined): number | "tail" | undefined {
@@ -187,6 +248,7 @@ export interface PostPullOutcome {
 export function withPostPull(
   source: ReadableStream<ExecEvent>,
   sync: Sync,
+  runtimeId?: string,
 ): { stream: ReadableStream<ExecEvent>; outcome: Promise<PostPullOutcome> } {
   const reader = source.getReader();
   let resolveOutcome!: (outcome: PostPullOutcome) => void;
@@ -203,12 +265,15 @@ export function withPostPull(
             return;
           }
           reader.releaseLock();
-          const pulled = await runPostPull(sync);
+          const pulled = await runPostPull(sync, runtimeId);
           resolveOutcome(pulled);
           controller.close();
         } catch (error) {
           try {
             reader.releaseLock();
+          } catch {}
+          try {
+            await sync.onPullPending?.(error, runtimeId);
           } catch {}
           resolveOutcome({
             applied: 0,
@@ -223,6 +288,9 @@ export function withPostPull(
           await reader.cancel(reason);
         } finally {
           reader.releaseLock();
+          try {
+            await sync.onPullPending?.(reason, runtimeId);
+          } catch {}
           resolveOutcome({
             applied: 0,
             skipped: [],
@@ -236,9 +304,97 @@ export function withPostPull(
   return { stream, outcome };
 }
 
-async function runPostPull(sync: Sync): Promise<PostPullOutcome> {
+export function withDeferredPostPull(
+  source: ReadableStream<ExecEvent>,
+  sync: Sync,
+  runtimeId?: string,
+): { stream: ReadableStream<ExecEvent>; outcome: Promise<PostPullOutcome> } {
+  const reader = source.getReader();
+  let resolveOutcome!: (outcome: PostPullOutcome) => void;
+  const outcome = new Promise<PostPullOutcome>((resolve) => {
+    resolveOutcome = resolve;
+  });
+  const settle = async () => {
+    let metadata: Awaited<ReturnType<NonNullable<Sync["onPostExecPending"]>>> = {};
+    let error: unknown;
+    try {
+      metadata = (await sync.onPostExecPending?.(runtimeId)) ?? {};
+    } catch (caught) {
+      error = caught;
+    }
+    resolveOutcome({
+      applied: 0,
+      skipped: [],
+      sync: {
+        status: "pending",
+        applied: 0,
+        skipped: [],
+        ...(error === undefined ? {} : { error: safeErrorMessage(error) }),
+        ...metadata,
+      },
+    });
+  };
+  const settleUnfenced = async (error: unknown) => {
+    try {
+      await sync.onPullPending?.(error, runtimeId);
+    } catch {}
+    resolveOutcome({
+      applied: 0,
+      skipped: [],
+      sync: {
+        status: "pending",
+        applied: 0,
+        skipped: [],
+        error: safeErrorMessage(error),
+      },
+    });
+  };
+  const stream = new ReadableStream<ExecEvent>(
+    {
+      async pull(controller) {
+        try {
+          const next = await reader.read();
+          if (!next.done) {
+            controller.enqueue(next.value);
+            return;
+          }
+          reader.releaseLock();
+          await settle();
+          controller.close();
+        } catch (error) {
+          try {
+            reader.releaseLock();
+          } catch {}
+          await settleUnfenced(error);
+          controller.error(error);
+        }
+      },
+      async cancel() {
+        // Cancelling an event subscription does not stop the command.
+        // Keep draining so backpressure cannot stall it, then capture
+        // the target only after its stream closes. The cancellation
+        // promise is the durability boundary: it resolves only after
+        // the retry intent has been stored.
+        try {
+          while (!(await reader.read()).done) {}
+          reader.releaseLock();
+          await settle();
+        } catch (error) {
+          try {
+            reader.releaseLock();
+          } catch {}
+          await settleUnfenced(error);
+        }
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return { stream, outcome };
+}
+
+async function runPostPull(sync: Sync, runtimeId?: string): Promise<PostPullOutcome> {
   try {
-    const result = await sync.pull();
+    const result = await sync.pull(runtimeId);
     return {
       applied: result.applied,
       skipped: result.skipped,
@@ -246,7 +402,7 @@ async function runPostPull(sync: Sync): Promise<PostPullOutcome> {
     };
   } catch (error) {
     try {
-      await sync.onPullPending?.(error);
+      await sync.onPullPending?.(error, runtimeId);
     } catch {}
     return {
       applied: 0,

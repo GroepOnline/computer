@@ -3,7 +3,7 @@
 // into the DO. Two-and-a-half pieces of logic to pin:
 //
 //   - /health answers 200 ok\n (the port-readiness probe).
-//   - /ws looks up env[binding] and forwards the request to the
+//   - /api looks up env[binding] and forwards the request to the
 //     named DO instance.
 //   - anything else is 404.
 //
@@ -34,35 +34,55 @@ describe("WorkspaceProxy", () => {
     expect(res.headers.get("content-type")).toMatch(/text\/plain/);
   });
 
-  it("/ws forwards to the DO at env[binding]", async () => {
-    const res = await SELF.fetch("http://proxy.test/ws", {
+  it("/api forwards to the DO at env[binding]", async () => {
+    const res = await SELF.fetch("http://proxy.test/api", {
       headers: { "x-test-id": freshId(), "x-test-binding": "COMPUTERD" },
     });
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("from-do");
   });
 
-  it("accepts tokenized callback health and forwards a normalized tokenized /ws", async () => {
+  it("accepts tokenized callback health and normalizes the tokenized callback to /api", async () => {
     const token = "123e4567-e89b-12d3-a456-426614174000";
     const health = await SELF.fetch(`http://proxy.test/__workspace_connect/${token}/health`, {
       headers: { "x-test-id": freshId() },
     });
     expect(health.status).toBe(200);
-    const websocket = await SELF.fetch(`http://proxy.test/__workspace_connect/${token}/ws`, {
+    const websocket = await SELF.fetch(`http://proxy.test/__workspace_connect/${token}/api`, {
       headers: { "x-test-id": freshId(), "x-test-binding": "COMPUTERD" },
     });
     expect(await websocket.text()).toBe(`from-do:${token}`);
   });
 
-  it("/ws returns 500 when env[binding] is missing", async () => {
-    const res = await SELF.fetch("http://proxy.test/ws", {
+  it("routes egress callbacks through /api while preserving the original request", async () => {
+    const res = await SELF.fetch("https://api.example.test/v1/data?format=json", {
+      method: "POST",
+      body: "payload",
+      headers: {
+        "content-type": "text/plain",
+        "x-test-id": freshId(),
+        "x-test-egress-token": "secret-token",
+      },
+    });
+
+    expect(await res.json()).toEqual({
+      callbackUrl: "https://api.example.test/api",
+      originalUrl: "https://api.example.test/v1/data?format=json",
+      egressToken: "secret-token",
+      method: "POST",
+      body: "payload",
+    });
+  });
+
+  it("/api returns 500 when env[binding] is missing", async () => {
+    const res = await SELF.fetch("http://proxy.test/api", {
       headers: { "x-test-id": freshId(), "x-test-binding": "NOT_A_BINDING" },
     });
     expect(res.status).toBe(500);
     expect(await res.text()).toMatch(/NOT_A_BINDING is not a DurableObjectNamespace/);
   });
 
-  it("returns 404 for paths other than /health and /ws", async () => {
+  it("returns 404 for paths other than /health and /api", async () => {
     const res = await SELF.fetch("http://proxy.test/anything-else", {
       headers: { "x-test-id": freshId() },
     });

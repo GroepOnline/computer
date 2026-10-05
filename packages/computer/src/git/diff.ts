@@ -29,6 +29,8 @@ export interface IsomorphicGitDiffClient {
     dir: string;
     ref?: string;
     cache?: object;
+    /** Prunes the worktree walk to these paths. Omit to walk it all. */
+    filepaths?: string[];
   }): Promise<StatusMatrixRow[]>;
   readBlob(args: {
     fs: object;
@@ -166,7 +168,21 @@ async function collectDiffEntries(opts: DiffWithDeps): Promise<DiffEntry[]> {
   // requested commit rather than always HEAD. Without this the
   // `ref` argument would only affect blob reads, leaving the
   // status walk silently skewed.
-  const status = await opts.git.statusMatrix({ fs: opts.fs, dir, ref, cache: opts.cache });
+  // Scope the walk when the caller named paths. isomorphic-git prunes
+  // the traversal to these prefixes instead of visiting the whole
+  // worktree and handing every path to `map`, which matters once the
+  // tree carries a synced node_modules. `filepaths` uses the same
+  // "exact path or directory prefix" rule as makePathFilter below, so
+  // the filter stays as the authority on what is emitted and this is
+  // purely a traversal hint.
+  const scopedPaths = normalizeFilepaths(opts.paths);
+  const status = await opts.git.statusMatrix({
+    fs: opts.fs,
+    dir,
+    ref,
+    cache: opts.cache,
+    ...(scopedPaths === undefined ? {} : { filepaths: scopedPaths }),
+  });
   const pathFilter = makePathFilter(opts.paths);
   const entries: DiffEntry[] = [];
   for (const [filepath, headStatus, workdirStatus] of status) {
@@ -175,12 +191,13 @@ async function collectDiffEntries(opts: DiffWithDeps): Promise<DiffEntry[]> {
     if (workdirStatus === 1) continue;
     if (!pathFilter(filepath)) continue;
 
-    const oldText =
-      headStatus === 1
-        ? await readBlobAsText(opts.git, opts.fs, dir, head, filepath, opts.cache)
-        : "";
-    const newText =
-      workdirStatus === 2 ? await readWorkdirAsText(opts.readFile, dir, filepath) : "";
+    const oldExists = headStatus === 1;
+    const newExists = workdirStatus > 0;
+    const oldText = oldExists
+      ? await readBlobAsText(opts.git, opts.fs, dir, head, filepath, opts.cache)
+      : "";
+    const newText = newExists ? await readWorkdirAsText(opts.readFile, dir, filepath) : "";
+    if (oldExists === newExists && oldText === newText) continue;
     // headStatus 0 -> not in the base -> added. workdirStatus 0
     // -> gone from the working tree -> deleted. Otherwise it's a
     // content change.
@@ -221,7 +238,7 @@ async function collectRefToRef(
       ? await readBlobAsText(opts.git, opts.fs, dir, fromOid, filepath, opts.cache)
       : "";
     const b = inTo ? await readBlobAsText(opts.git, opts.fs, dir, toOid, filepath, opts.cache) : "";
-    if (a === b) continue;
+    if (inFrom === inTo && a === b) continue;
     const status: DiffEntry["status"] = !inFrom ? "A" : !inTo ? "D" : "M";
     entries.push({ path: filepath, status, oldText: a, newText: b });
   }
@@ -259,6 +276,17 @@ async function listFilesAt(
 ): Promise<string[]> {
   if (typeof git.listFiles !== "function") return [];
   return git.listFiles({ fs, dir, ref });
+}
+
+// The `filepaths` form isomorphic-git wants: normalized, deduplicated,
+// and undefined when the caller asked for no scoping (so the library's
+// own default of ['.'] stands). An empty string normalizes to the repo
+// root, which would scope to everything — treat it as no scope.
+function normalizeFilepaths(paths: string[] | undefined): string[] | undefined {
+  if (paths === undefined || paths.length === 0) return undefined;
+  const out = [...new Set(paths.map((p) => normalizePath(p)))];
+  if (out.some((p) => p === "" || p === ".")) return undefined;
+  return out;
 }
 
 function makePathFilter(paths: string[] | undefined): (p: string) => boolean {

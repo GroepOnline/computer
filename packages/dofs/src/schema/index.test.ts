@@ -444,6 +444,132 @@ describe("initializeSchema", () => {
     expect(norm(tableSql("vfs_chunks"))).toBe(norm(freshSql("vfs_chunks")));
   });
 
+  it("creates vfs_changes_by_op_rev on a fresh DB and uses it for the tombstone scan", () => {
+    const storage = new SQLiteTestStorage();
+    const db = new Database(storage);
+    initializeSchema(db, () => 0);
+
+    const indexNames = db
+      .all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'")
+      .map((r) => r.name);
+    expect(indexNames).toContain("vfs_changes_by_op_rev");
+
+    // The coalesce tombstone query must be able to restrict on rev
+    // rather than scanning the whole table. Before this index the plan
+    // was `SCAN vfs_changes USING INDEX vfs_changes_by_path`, which
+    // ignores the rev predicate entirely.
+    const plan = db
+      .all<{ detail: string }>(
+        `EXPLAIN QUERY PLAN
+         SELECT path, MAX(rev) AS rev FROM vfs_changes
+          WHERE rev > ? AND op = 'delete' GROUP BY path`,
+        0,
+      )
+      .map((r) => r.detail)
+      .join(" | ");
+    expect(plan).toContain("vfs_changes_by_op_rev");
+    expect(plan).not.toMatch(/SCAN vfs_changes(?! USING)/);
+  });
+
+  it("adds vfs_changes_by_op_rev on the v7 -> v8 upgrade, preserving tombstones", () => {
+    // Stage a v7-shape database: everything current except the new
+    // index. The migrator must add it without disturbing existing rows.
+    const storage = new SQLiteTestStorage();
+    const db = new Database(storage);
+
+    initializeSchema(db, () => 0);
+    db.run("INSERT INTO vfs_changes (rev, path, op) VALUES (?, ?, 'delete')", 5, "/a.txt");
+    db.run("INSERT INTO vfs_changes (rev, path, op) VALUES (?, ?, 'delete')", 7, "/b.txt");
+    db.run("INSERT INTO vfs_changes (rev, path, op) VALUES (?, ?, 'delete')", 9, "/a.txt");
+    const before = db.all("SELECT id, rev, path, op FROM vfs_changes ORDER BY id");
+
+    // Roll the database back to v7: drop the index and restamp.
+    db.run("DROP INDEX IF EXISTS vfs_changes_by_op_rev");
+    db.run("UPDATE vfs_meta SET v = 7 WHERE k = 'schema_version'");
+    expect(
+      db
+        .all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .map((r) => r.name),
+    ).not.toContain("vfs_changes_by_op_rev");
+
+    initializeSchema(db, () => 0);
+
+    expect(db.one<{ v: number }>("SELECT v FROM vfs_meta WHERE k = 'schema_version'")?.v).toBe(
+      SCHEMA_VERSION,
+    );
+    expect(
+      db
+        .all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .map((r) => r.name),
+    ).toContain("vfs_changes_by_op_rev");
+    expect(db.all("SELECT id, rev, path, op FROM vfs_changes ORDER BY id")).toEqual(before);
+
+    // The pre-existing path index must survive the upgrade too.
+    expect(
+      db
+        .all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .map((r) => r.name),
+    ).toContain("vfs_changes_by_path");
+  });
+
+  it("upgrades a v6 database with the sync operation tables", () => {
+    const storage = new SQLiteTestStorage();
+    const db = new Database(storage);
+
+    // A v6 database: everything the current baseline creates except
+    // the two tables v7 adds. Simulated by initializing at the
+    // current baseline, dropping the new tables, and winding the
+    // stamped version back — the migrator must create them rather
+    // than relying on the IF NOT EXISTS baseline having done it.
+    initializeSchema(db, () => 0);
+    db.run("DROP TABLE _vfs_sync_operations");
+    db.run("DROP TABLE _vfs_sync_skips");
+    db.run("UPDATE vfs_meta SET v = ? WHERE k = ?", 6, "schema_version");
+
+    // Existing sync progress must survive the upgrade untouched: the
+    // operation table is additive and backfills nothing.
+    db.run(
+      "INSERT INTO _vfs_watermark (k, backend, v) VALUES (?, ?, ?) " +
+        "ON CONFLICT(k, backend) DO UPDATE SET v = excluded.v",
+      "fetchRev",
+      "container",
+      77,
+    );
+
+    initializeSchema(db, () => 0);
+
+    expect(db.one<{ v: number }>("SELECT v FROM vfs_meta WHERE k = ?", "schema_version")?.v).toBe(
+      SCHEMA_VERSION,
+    );
+    expect(
+      db.scalar<number>(
+        "SELECT v FROM _vfs_watermark WHERE k = ? AND backend = ?",
+        "fetchRev",
+        "container",
+      ),
+    ).toBe(77);
+
+    // An upgraded database has no in-flight operation, so the first
+    // pull after the upgrade captures a fresh target.
+    expect(db.one<{ c: number }>("SELECT COUNT(*) AS c FROM _vfs_sync_operations")?.c).toBe(0);
+
+    // The migrated shape must match a fresh install, or the two
+    // install paths diverge and only one gets tested.
+    const tableSql = (source: Database, name: string): string =>
+      source.one<{ sql: string }>(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        name,
+      )?.sql ?? "";
+    const fresh = new Database(new SQLiteTestStorage());
+    initializeSchema(fresh, () => 0);
+    const norm = (sql: string): string => sql.replace(/\s+/g, " ").trim().toUpperCase();
+
+    expect(norm(tableSql(db, "_vfs_sync_operations"))).toBe(
+      norm(tableSql(fresh, "_vfs_sync_operations")),
+    );
+    expect(norm(tableSql(db, "_vfs_sync_skips"))).toBe(norm(tableSql(fresh, "_vfs_sync_skips")));
+  });
+
   it("is idempotent across repeat calls", () => {
     const storage = new SQLiteTestStorage();
     const db = new Database(storage);

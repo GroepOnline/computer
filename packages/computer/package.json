@@ -1,6 +1,6 @@
 {
   "name": "@cloudflare/computer",
-  "version": "0.1.0-alpha.1",
+  "version": "0.4.1",
   "description": "Cloudflare Computer — a SQLite-backed virtual filesystem with sync to a container-side daemon (computerd).",
   "license": "MIT",
   "repository": {
@@ -13,6 +13,7 @@
   "publishConfig": {
     "tag": "unreleased"
   },
+  "sideEffects": false,
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -34,6 +35,18 @@
       "types": "./dist/tools/index.d.ts",
       "import": "./dist/tools/index.js"
     },
+    "./tools/pi-ai": {
+      "types": "./dist/tools/pi-ai.d.ts",
+      "import": "./dist/tools/pi-ai.js"
+    },
+    "./tools/tanstack-ai": {
+      "types": "./dist/tools/tanstack-ai.d.ts",
+      "import": "./dist/tools/tanstack-ai.js"
+    },
+    "./backends/container-legacy": {
+      "types": "./dist/backends/container-legacy/index.d.ts",
+      "import": "./dist/backends/container-legacy/index.js"
+    },
     "./backends/container": {
       "types": "./dist/backends/container/index.d.ts",
       "import": "./dist/backends/container/index.js"
@@ -45,6 +58,46 @@
     "./backends/worker-shell": {
       "types": "./dist/backends/worker-shell/index.d.ts",
       "import": "./dist/backends/worker-shell/index.js"
+    },
+    "./shell/core": {
+      "types": "./dist/backends/worker-shell/shell/core.d.ts",
+      "default": "./dist/backends/worker-shell/shell/core.js"
+    },
+    "./shell/curl": {
+      "types": "./dist/backends/worker-shell/shell/curl.d.ts",
+      "default": "./dist/backends/worker-shell/shell/curl.js"
+    },
+    "./shell/html-to-markdown": {
+      "types": "./dist/backends/worker-shell/shell/html-to-markdown.d.ts",
+      "default": "./dist/backends/worker-shell/shell/html-to-markdown.js"
+    },
+    "./shell/python": {
+      "types": "./dist/backends/worker-shell/shell/python.d.ts",
+      "default": "./dist/backends/worker-shell/shell/python.js"
+    },
+    "./shell/sqlite": {
+      "types": "./dist/backends/worker-shell/shell/sqlite.d.ts",
+      "default": "./dist/backends/worker-shell/shell/sqlite.js"
+    },
+    "./shell/js-exec": {
+      "types": "./dist/backends/worker-shell/shell/js-exec.d.ts",
+      "default": "./dist/backends/worker-shell/shell/js-exec.js"
+    },
+    "./shell/yq": {
+      "types": "./dist/backends/worker-shell/shell/yq.d.ts",
+      "default": "./dist/backends/worker-shell/shell/yq.js"
+    },
+    "./shell/file": {
+      "types": "./dist/backends/worker-shell/shell/file.d.ts",
+      "default": "./dist/backends/worker-shell/shell/file.js"
+    },
+    "./shell/xan": {
+      "types": "./dist/backends/worker-shell/shell/xan.d.ts",
+      "default": "./dist/backends/worker-shell/shell/xan.js"
+    },
+    "./shell/jq": {
+      "types": "./dist/backends/worker-shell/shell/jq.d.ts",
+      "default": "./dist/backends/worker-shell/shell/jq.js"
     },
     "./observe/cloudflare": {
       "types": "./dist/observe/cloudflare.d.ts",
@@ -76,15 +129,19 @@
   },
   "dependencies": {
     "acorn": "^8.17.0",
-    "capnweb": "^0.8.0",
+    "capnweb": "^0.10.0",
     "just-bash": "^3.0.1"
   },
   "peerDependencies": {
+    "@cloudflare/workers-types": "^4.20260616.1 || ^5.20260921.1",
     "@platformatic/vfs": "*",
     "ai": "^6.0.196 || ^7.0.0",
     "zod": "^4.4.3"
   },
   "peerDependenciesMeta": {
+    "@cloudflare/workers-types": {
+      "optional": true
+    },
     "@platformatic/vfs": {
       "optional": true
     },
@@ -99,8 +156,10 @@
     "@cloudflare/computer-rpc": "*",
     "@cloudflare/dofs": "*",
     "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@cloudflare/workers-types": "^4.20260616.1",
+    "@cloudflare/workers-types": "^4.20260616.1 || ^5.20260921.1",
+    "@earendil-works/pi-ai": "^0.99.2",
     "@platformatic/vfs": "^0.4.0",
+    "@tanstack/ai": "^0.63.0",
     "ai": "^7.0.0",
     "diff": "^9.0.0",
     "esbuild": "^0.28.1",
@@ -110,7 +169,7 @@
     "rolldown-plugin-dts": "^0.25.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.11",
-    "wrangler": "^4.140.0",
+    "wrangler": "^4.137.0",
     "zod": "^4.4.3"
   }
 }

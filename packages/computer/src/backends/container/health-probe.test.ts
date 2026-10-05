@@ -1,3 +1,9 @@
+// Duplicated verbatim from ../container-legacy/. The two backends serve
+// different container scheduling policies, but this file touches
+// neither the launch spec nor the policy, so there is no divergence
+// pressure on it and the copy is deliberate rather than overlooked.
+// Fixes here apply to both copies.
+//
 import { describe, expect, test, vi } from "vitest";
 
 import type { IWorkspaceContainerAPI } from "./container-host.js";

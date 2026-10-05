@@ -1,8 +1,15 @@
+// Duplicated from ../container-legacy/, differing only in the name of
+// the host interface it probes through. The two backends serve
+// different container scheduling policies, but this file touches
+// neither the launch spec nor the policy, so there is no divergence
+// pressure on it and the copy is deliberate rather than overlooked.
+// Fixes here apply to both copies.
+//
 // Shared computerd health probe.
 //
 // Used in two places that must agree on what "healthy" means:
 //
-//   - CloudflareContainerBackend.connect() startup readiness, in
+//   - LegacyContainerBackend.connect() startup readiness, in
 //     place of the previous private #waitForPort loop;
 //   - the keep-alive alarm's lease-time check.
 //

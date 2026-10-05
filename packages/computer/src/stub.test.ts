@@ -47,14 +47,16 @@ function composite(
 }
 
 function fakeSync(): import("@cloudflare/computer-rpc").SyncRPC {
+  let appliedPushRev = 0;
   return {
-    async push() {
-      return { rev: 0, appliedPushCursor: { rev: 0, path: null } };
+    async push(input) {
+      appliedPushRev = input.senderRev;
+      return { rev: 0, appliedPushCursor: { rev: appliedPushRev, path: null } };
     },
     async fetchChanges() {
       return {
         currentCursor: { rev: 0, path: null },
-        appliedPushCursor: { rev: 0, path: null },
+        appliedPushCursor: { rev: appliedPushRev, path: null },
         stream: new ReadableStream<import("@cloudflare/dofs").ChangeEntry>({
           start(c) {
             c.close();
@@ -66,7 +68,11 @@ function fakeSync(): import("@cloudflare/computer-rpc").SyncRPC {
       return null;
     },
     async watermarks() {
-      return { currentRev: 0, pushRev: 0, fetchCursor: { rev: 0, path: null } };
+      return {
+        currentRev: 0,
+        pushRev: 0,
+        fetchCursor: { rev: appliedPushRev, path: null },
+      };
     },
     async hasObjects() {
       return [];
@@ -205,6 +211,16 @@ describe("WorkspaceStub", () => {
     });
   });
 
+  it("fs.readFile forwards ranged stream options", async () => {
+    await withStub(async (ws) => {
+      const stub = ws.stub();
+      await stub.fs.writeFile("/bin", new Uint8Array([1, 2, 3, 4, 5]));
+      const stream = await stub.fs.readFile("/bin", { byteOffset: 1, byteLength: 3 });
+      const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+      expect(Array.from(bytes)).toEqual([2, 3, 4]);
+    });
+  });
+
   it("fs.readdir forwards bounded-read options", async () => {
     await withStub(async (ws) => {
       const stub = ws.stub();
@@ -215,6 +231,75 @@ describe("WorkspaceStub", () => {
         "a",
         "b",
       ]);
+    });
+  });
+
+  it("fs.find forwards bounded search options", async () => {
+    await withStub(async (ws) => {
+      const stub = ws.stub();
+      await ws.fs.writeFile("/a.ts", "");
+      await ws.fs.writeFile("/b.ts", "");
+      await ws.fs.writeFile("/c.ts", "");
+      expect(await stub.fs.find("/", "*.ts", { limit: 1, offset: 1 })).toEqual([
+        { path: "/b.ts", type: "file" },
+      ]);
+    });
+  });
+
+  it("fs.find forwards exclusion patterns", async () => {
+    await withStub(async (ws) => {
+      const stub = ws.stub();
+      await ws.fs.mkdir("/keep");
+      await ws.fs.mkdir("/node_modules/dep", { recursive: true });
+      await ws.fs.writeFile("/keep/a.ts", "");
+      await ws.fs.writeFile("/node_modules/dep/b.ts", "");
+      expect(
+        await stub.fs.find("/", "**/*.ts", { exclude: ["node_modules", "node_modules/**"] }),
+      ).toEqual([{ path: "/keep/a.ts", type: "file" }]);
+    });
+  });
+
+  it("fs.rename moves a file in one call", async () => {
+    await withStub(async (ws) => {
+      const stub = ws.stub();
+      await ws.fs.writeFile("/old.txt", "payload");
+      await stub.fs.rename("/old.txt", "/new.txt");
+      expect(await ws.fs.readFile("/new.txt", "utf8")).toBe("payload");
+      await expect(ws.fs.stat("/old.txt")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  it("fs.rename moves a directory subtree", async () => {
+    await withStub(async (ws) => {
+      const stub = ws.stub();
+      await ws.fs.mkdir("/src/nested", { recursive: true });
+      await ws.fs.writeFile("/src/nested/a.txt", "a");
+      await stub.fs.rename("/src", "/dst");
+      expect(await ws.fs.readFile("/dst/nested/a.txt", "utf8")).toBe("a");
+      await expect(ws.fs.stat("/src")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  it("fs.rename replaces an existing file and reports POSIX errors", async () => {
+    await withStub(async (ws) => {
+      const stub = ws.stub();
+      await ws.fs.writeFile("/a.txt", "a");
+      await ws.fs.writeFile("/b.txt", "b");
+      await stub.fs.rename("/a.txt", "/b.txt");
+      expect(await ws.fs.readFile("/b.txt", "utf8")).toBe("a");
+
+      await expect(stub.fs.rename("/missing", "/somewhere")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      await ws.fs.mkdir("/dir");
+      await ws.fs.writeFile("/dir/child.txt", "c");
+      await ws.fs.writeFile("/file.txt", "f");
+      await expect(stub.fs.rename("/file.txt", "/dir")).rejects.toMatchObject({ code: "EISDIR" });
+      await ws.fs.mkdir("/other");
+      await expect(stub.fs.rename("/other", "/dir")).rejects.toMatchObject({ code: "ENOTEMPTY" });
+      await expect(stub.fs.rename("/dir", "/file.txt")).rejects.toMatchObject({ code: "ENOTDIR" });
+      await expect(stub.fs.rename("/file.txt", "/")).rejects.toMatchObject({ code: "EINVAL" });
     });
   });
 

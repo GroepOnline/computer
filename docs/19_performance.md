@@ -3,7 +3,7 @@
 Numbers from `script/fs-bench.sh` and a full
 `npm install` of [`cloudflare/sandbox-sdk`](https://github.com/cloudflare/sandbox-sdk)
 (854 packages, 36,675 files), running
-[`examples/container`](../examples/container) on a Cloudflare
+[`examples/container-legacy`](../examples/container-legacy) on a Cloudflare
 Containers **standard-2** instance (1 vCPU, 6 GiB memory, 12 GB disk).
 The computerd FUSE mount lives at `/workspace`; the comparison columns are
 an in-memory `tmpfs` at `/tmp` and the container's ext4 root disk at
@@ -47,6 +47,113 @@ computerd beats the baseline.
 computerd is ~2x slower than the container's ext4 disk for the full
 `npm install`, and ~3.6x slower than tmpfs. The disk comparison is
 the more realistic baseline for general usage.
+
+> [!IMPORTANT]
+> These numbers measure the **mount**, not the **pull**. They stop when
+> `npm install` returns. What follows — moving 36,675 files into the
+> Durable Object — is not counted here, and for a dependency tree it is
+> the larger cost.
+>
+> [#179](https://github.com/cloudflare/computer/issues/179) reports an
+> install timing out at 120 s and then taking ~3 further minutes to
+> return while the partial `node_modules` was pulled, after which the
+> next command failed with a storage timeout the workspace did not
+> recover from. None of that is visible in the table above.
+>
+> If you are sizing a workload against these figures, add the transfer
+> yourself, or keep the tree out of sync entirely — see
+> [`computerd`: Local-only paths](../packages/computerd/README.md#local-only-paths-mount_ignore).
+
+## Local-only paths (`MOUNT_IGNORE`)
+
+A path matched by `MOUNT_IGNORE` is served from the container's disk and
+never enters the VFS, the store, the change-pack encoding, or the pull.
+
+What this does **not** change is the FUSE round trip: the bytes still
+cross from the kernel into the daemon. Passthrough (`FOPEN_PASSTHROUGH`)
+would remove that too, but computerd mounts through `fuse-native`, which
+binds libfuse 2.9, and passthrough needs the libfuse 3.17 API. So expect
+a local-only `npm install` to track the `computerd FUSE` row above
+rather than the `ext4 disk` row.
+
+The saving is the transfer, and for a dependency tree the transfer is
+most of the wall clock.
+
+| Scenario | Install duration | Bytes pulled into the DO |
+|---|---:|---:|
+| `npm install` to a synced path | 124.7 s | *(not yet measured)* |
+| `npm install` to a `MOUNT_IGNORE` path | *(not yet measured)* | 0 by construction |
+
+> [!NOTE]
+> The empty cells are deliberate. Bytes-pulled is the load-bearing
+> number for this feature and it has not been measured yet; the zero in
+> the last cell is a property of the design — an ignored path produces
+> no sync entries — not an observation. Fill the table from the same
+> `cloudflare/sandbox-sdk` install used above, on the same instance
+> type, before quoting any of it.
+
+## In-memory store versus on-disk store
+
+`computerd` keeps its SQLite store in memory by default. Set
+`COMPUTERD_DB` to a path and it goes on the container's disk instead.
+
+These numbers come from `script/store-compare.mjs`, which uses the
+dofs filesystem directly with 2,000 files in one directory. There is
+no FUSE mount involved, so any difference is down to the store.
+
+| Operation | memory | on disk (64 MiB cache) | ratio |
+|---|---:|---:|---:|
+| create 2000 files | 180.9 ms | 659.1 ms | 3.64x |
+| stat 2000 paths, cold | 1580.4 ms | 1558.7 ms | **0.99x** |
+| stat 2000 paths, warm | 12.1 ms | 15.1 ms | 1.25x |
+| readdir x50 | 155.4 ms | 143.1 ms | **0.92x** |
+
+Reads are not slower on disk. That holds even when the cache is far
+too small for the tree: a 2 MiB cache against a 3.8 MiB database still
+reads at 0.99x. Two reasons. Most of the time goes on walking the path
+rather than fetching pages, and the operating system caches whatever
+SQLite drops.
+
+Writes are slower, and the reason is the cost of flushing to disk.
+Creating 1,000 files takes 445 ms at `synchronous = full`, 292 ms at
+`normal` (what we ship), and 148 ms at `off` — which matches the
+in-memory store's 181 ms.
+
+Through a real FUSE mount the write cost shrinks, because the mount
+itself is already the bigger expense:
+
+| Scenario | memory store | file store | baseline |
+|---|---:|---:|---:|
+| stat 1000 files | 2777.3 ms (1.10x) | 3114.9 ms (1.22x) | ~2540 ms |
+| create 1000 files | 989.4 ms (0.98x) | 1178.7 ms (1.17x) | ~1010 ms |
+| write 64 MiB | 238.1 ms (11.14x) | 221.9 ms (12.69x) | ~19 ms |
+| overwrite 64 MiB | 294.3 ms (26.16x) | 304.6 ms (29.30x) | ~11 ms |
+
+## Restore time
+
+This is what the on-disk store buys. `script/restore-time.mjs` times
+what a host waits after a restart: connect, compare sync positions,
+and send whatever the other side is missing.
+
+| Tree | memory store | file store |
+|---|---:|---:|
+| 500 files | 480 ms (502 entries sent) | 26 ms (0 sent) |
+| 3,000 files | 3749 ms (3002 entries sent) | 23 ms (0 sent) |
+
+An in-memory store sends the whole workspace again after every
+restart, so its cost grows with the tree. A file store sends nothing,
+because the sync positions came back along with the files. Restoring
+takes about 25 ms whatever the size, so the saving grows too: 18x at
+500 files, 161x at 3,000.
+
+The trade: small-file work costs 10 to 20 percent more, and a restart
+costs a flat 25 ms instead of resending everything.
+
+Two things these numbers do not cover. They come from one Linux
+container, not from Cloudflare Containers hardware, and a full
+`cloudflare/sandbox-sdk` `npm install` has not been run. The restore
+figures also drive the sync protocol in process, so they show the work
+avoided but not the network round trips a real host would also skip.
 
 ## Where computerd is faster than the disk baseline
 

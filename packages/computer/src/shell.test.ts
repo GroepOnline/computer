@@ -299,6 +299,37 @@ describe("CommandExecutor.exec — envelope events", () => {
 });
 
 describe("CommandExecutor.exec — push/pull bracket", () => {
+  it("defers post-command synchronization until a durable intent is scheduled", async () => {
+    const f = fakeRpc({ events: [exit(1, 0)] });
+    const order: string[] = [];
+    const sync: Sync = {
+      async push() {
+        order.push("push");
+        return 0;
+      },
+      async pull() {
+        order.push("pull");
+        return applied(1);
+      },
+      async onPostExecPending() {
+        order.push("schedule");
+        return { backend: "container", runtimeId: "runtime-1" };
+      },
+    };
+    const execution = await new CommandExecutor(f.rpc.shell, sync).exec("noop", {
+      sync: "defer",
+    });
+    const { outcome } = await drain(execution);
+    expect(order).toEqual(["push", "schedule"]);
+    expect(outcome).toMatchObject({
+      sync: {
+        status: "pending",
+        backend: "container",
+        runtimeId: "runtime-1",
+      },
+    });
+  });
+
   it("reports pushed up front and the pull outcome after drain", async () => {
     const f = fakeRpc({ events: [stdout(1, "hi"), exit(2, 0)] });
     const sync: Sync = {
@@ -309,7 +340,7 @@ describe("CommandExecutor.exec — push/pull bracket", () => {
         return applied(7);
       },
     };
-    const execution = await new CommandExecutor(f.rpc.shell, sync).exec("noop");
+    const execution = await new CommandExecutor(f.rpc.shell, sync).exec("noop", { sync: "wait" });
     expect(execution.sync.pushed).toBe(5);
     const { outcome } = await drain(execution);
     expect(outcome).toEqual({
@@ -365,7 +396,7 @@ describe("CommandExecutor.exec — push/pull bracket", () => {
     expect(order).toEqual(["push", "pull"]); // pull fired after drain
   });
 
-  it("falls back to pushed = 0 when sync.push() throws", async () => {
+  it("fails before spawn when the pre-exec push throws", async () => {
     const f = fakeRpc({ events: [exit(1, 0)] });
     const sync: Sync = {
       async push() {
@@ -375,11 +406,11 @@ describe("CommandExecutor.exec — push/pull bracket", () => {
         return applied(3);
       },
     };
-    const execution = await new CommandExecutor(f.rpc.shell, sync).exec("noop");
-    expect(execution.sync.pushed).toBe(0);
-    // pull still fires — docs/05 says one failed half doesn't abort the other
-    const { outcome } = await drain(execution);
-    expect((outcome as { applied: number }).applied).toBe(3);
+
+    await expect(new CommandExecutor(f.rpc.shell, sync).exec("noop")).rejects.toThrow(
+      "push offline",
+    );
+    expect(f.calls.exec).toHaveLength(0);
   });
 
   it("reports a pending sync after a Durable Object storage reset", async () => {
@@ -494,5 +525,81 @@ describe("CommandExecutor.get — reattach", () => {
     expect(pushCalls).toBe(0);
     expect(pullCalls).toBe(1);
     expect((outcome as { applied: number }).applied).toBe(2);
+  });
+});
+
+describe("CommandExecutor cancellation", () => {
+  it("schedules synchronization when the event stream is cancelled", async () => {
+    const f = fakeRpc({ events: [stdout(1, "output"), exit(2, 0)] });
+    let scheduled = 0;
+    const sync: Sync = {
+      async push() {
+        return 0;
+      },
+      async pull() {
+        return applied(0);
+      },
+      async onPullPending() {
+        scheduled += 1;
+      },
+    };
+    const execution = await new CommandExecutor(f.rpc.shell, sync).exec("noop");
+    await execution.events.cancel("consumer stopped");
+    await execution.sync.outcome;
+    expect(scheduled).toBe(1);
+  });
+
+  it("waits for a deferred command to finish before capturing its target after cancellation", async () => {
+    let source!: ReadableStreamDefaultController<ExecEvent>;
+    let sourceCancelled = false;
+    const shell: ShellRPC = {
+      async exec() {
+        return {
+          id: "still-running",
+          events: new ReadableStream<ExecEvent>({
+            start(controller) {
+              source = controller;
+            },
+            cancel() {
+              sourceCancelled = true;
+            },
+          }),
+        };
+      },
+      async getExec() {
+        throw new Error("unused");
+      },
+      async killExec() {},
+      async disposeExec() {},
+    };
+    let scheduled = 0;
+    const sync: Sync = {
+      async push() {
+        return 0;
+      },
+      async pull() {
+        return applied(0);
+      },
+      async onPostExecPending() {
+        scheduled++;
+        return { targetCursor: { rev: 2, path: null } };
+      },
+    };
+    const execution = await new CommandExecutor(shell, sync).exec("build", {
+      sync: "defer",
+    });
+
+    const cancelling = execution.events.cancel("consumer stopped");
+    await Promise.resolve();
+    expect(sourceCancelled).toBe(false);
+    expect(scheduled).toBe(0);
+
+    source.enqueue(exit(1, 0));
+    source.close();
+    await cancelling;
+    await expect(execution.sync.outcome).resolves.toMatchObject({
+      sync: { status: "pending", targetCursor: { rev: 2, path: null } },
+    });
+    expect(scheduled).toBe(1);
   });
 });

@@ -24,7 +24,7 @@
 // All the SyncRPC streaming (push / pushObjects / fetchObjects /
 // fetchChanges) happens on the capnweb wire inside the DO. What
 // crosses the Workers-RPC boundary here is only the high-level
-// value-shaped facade — writeFile / readFile / stat / exec —
+// value-shaped wrapper — writeFile / readFile / stat / exec —
 // because Workers RPC doesn't carry non-byte ReadableStreams or
 // capnweb stubs.
 //
@@ -41,6 +41,7 @@
 
 import { trackStub, untrackStub } from "@cloudflare/computer-rpc/debug";
 import type {
+  FindOptions,
   GrepOptions,
   MkdirOptions,
   ReaddirOptions,
@@ -104,6 +105,11 @@ export class WorkspaceFilesystemStub extends RpcTarget {
 
   readFile(path: string): Promise<ReadableStream<Uint8Array>>;
   readFile(path: string, encoding: "utf8"): Promise<string>;
+  readFile(
+    path: string,
+    options: ReadFileOptions & { encoding?: undefined },
+  ): Promise<ReadableStream<Uint8Array>>;
+  readFile(path: string, options: ReadFileOptions & { encoding: "utf8" }): Promise<string>;
   readFile(path: string, options: ReadFileOptions): Promise<string | ReadableStream<Uint8Array>>;
   readFile(
     path: string,
@@ -185,12 +191,16 @@ export class WorkspaceFilesystemStub extends RpcTarget {
     );
   }
 
-  find(directory: string, pattern?: string): Promise<WorkspaceFoundEntry[]> {
+  find(
+    directory: string,
+    pattern?: string,
+    options: FindOptions = {},
+  ): Promise<WorkspaceFoundEntry[]> {
     return withSpan(
       this.#ws.observer,
       "workspace.fs.find",
       { "workspace.fs.path": directory, "workspace.fs.pattern": pattern },
-      () => this.#ws.fs.find(directory, pattern),
+      () => this.#ws.fs.find(directory, pattern, options),
       (span, outcome) => {
         if (outcome.ok) span.setAttribute("workspace.fs.matches", outcome.value.length);
       },
@@ -255,6 +265,19 @@ export class WorkspaceFilesystemStub extends RpcTarget {
         "workspace.fs.force": options.force,
       },
       () => this.#ws.fs.rm(path, options),
+    );
+  }
+
+  // Move a path in one store operation. Replaces the copy-then-delete
+  // dance callers used to write, so a failure can no longer leave both
+  // ends behind. Overwrite and error behavior is documented in
+  // docs/04_filesystem_interface.md.
+  rename(oldPath: string, newPath: string): Promise<void> {
+    return withSpan(
+      this.#ws.observer,
+      "workspace.fs.rename",
+      { "workspace.fs.path": oldPath, "workspace.fs.destination": newPath },
+      () => this.#ws.fs.rename(oldPath, newPath),
     );
   }
 

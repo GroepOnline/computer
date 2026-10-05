@@ -15,13 +15,14 @@
 import type { Database } from "../storage.js";
 
 import { chmod } from "./chmod.js";
-import { find, type WorkspaceFoundEntry } from "./find.js";
+import { type FindOptions, find, type WorkspaceFoundEntry } from "./find.js";
 import { type GrepOptions, grep, type WorkspaceGrepMatch } from "./grep.js";
 import { ls } from "./ls.js";
 import { type MkdirOptions, mkdir } from "./mkdir.js";
 import { type ReaddirOptions, readdir, type WorkspaceDirentResult } from "./readdir.js";
 import { type ReadFileOptions, readFile } from "./readFile.js";
 import { readlink } from "./readlink.js";
+import { rename } from "./rename.js";
 import { type RmOptions, rm } from "./rm.js";
 import { lstat, stat, type WorkspaceStatResult } from "./stat.js";
 import { symlink } from "./symlink.js";
@@ -46,6 +47,11 @@ export class WorkspaceFilesystem {
 
   readFile(path: string): Promise<ReadableStream<Uint8Array>>;
   readFile(path: string, encoding: "utf8"): Promise<string>;
+  readFile(
+    path: string,
+    options: ReadFileOptions & { encoding?: undefined },
+  ): Promise<ReadableStream<Uint8Array>>;
+  readFile(path: string, options: ReadFileOptions & { encoding: "utf8" }): Promise<string>;
   readFile(path: string, options: ReadFileOptions): Promise<string | ReadableStream<Uint8Array>>;
   readFile(
     path: string,
@@ -82,8 +88,12 @@ export class WorkspaceFilesystem {
     return readdir(this.db, path, options);
   }
 
-  async find(directory: string, pattern?: string): Promise<WorkspaceFoundEntry[]> {
-    return find(this.db, directory, pattern);
+  async find(
+    directory: string,
+    pattern?: string,
+    options: FindOptions = {},
+  ): Promise<WorkspaceFoundEntry[]> {
+    return find(this.db, directory, pattern, options);
   }
 
   async ls(prefix: string): Promise<string[]> {
@@ -110,6 +120,21 @@ export class WorkspaceFilesystem {
 
   async rm(path: string, options: RmOptions = {}): Promise<void> {
     rm(this.db, path, options);
+  }
+
+  // Move a file, directory or symbolic link in one transaction. An
+  // existing destination is replaced when the two ends agree on kind:
+  // a file or symbolic link replaces a file or symbolic link, and a
+  // directory replaces an empty directory.
+  //
+  // Errors: ENOENT when the source is missing or the destination's
+  // parent does not exist, ENOTEMPTY when the destination is a
+  // non-empty directory, EISDIR when a non-directory would replace a
+  // directory, ENOTDIR when a directory would replace a
+  // non-directory, EINVAL for the root at either end or a directory
+  // moved into itself, and EROFS under a read-only mount.
+  async rename(oldPath: string, newPath: string): Promise<void> {
+    rename(this.db, oldPath, newPath);
   }
 
   // Change the permission bits on a path. Follows symlinks like

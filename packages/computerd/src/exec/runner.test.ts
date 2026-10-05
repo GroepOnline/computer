@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+
 import { Database, initializeSchema, WorkspaceFilesystem } from "@cloudflare/dofs";
 import { SQLiteTestStorage } from "@cloudflare/dofs/testing";
 import { expect, test } from "vitest";
@@ -489,5 +491,102 @@ test("heartbeat seq is monotonically increasing with other events", async () => 
     }
   } finally {
     dispose();
+  }
+});
+
+test("a spawned command sees the allowlisted environment, not the daemon's", async () => {
+  // The daemon's environment holds its own configuration and, when the
+  // host sets one, the secret authorizing requests to its HTTP surface.
+  // Neither may reach a command the workspace runs.
+  process.env.RPC_CLIENT_SECRET = "must-not-escape";
+  process.env.COMPUTER_VAR_GREETING = "hello";
+  const { runner, dispose } = fixture();
+  try {
+    // Written without brace expansion so the assertion reads as shell
+    // rather than as a mistyped template literal.
+    const handle = runner.exec(
+      'printf \'[%s][%s]\' "$RPC_CLIENT_SECRET" "$GREETING"; test -n "$PATH" && printf \'[path]\'',
+    );
+    const events = await drain(handle.events);
+    const stdout = events
+      .filter((event) => event.name === "stdout")
+      .map((event) => decode(event.value as Uint8Array))
+      .join("");
+    expect(stdout).toBe("[][hello][path]");
+  } finally {
+    delete process.env.RPC_CLIENT_SECRET;
+    delete process.env.COMPUTER_VAR_GREETING;
+    dispose();
+  }
+});
+
+// The interpreter is a per-consumer choice, not a property of the image.
+//
+// A caller that redacts credentials through a pipe -- `git push "$URL" 2>&1 |
+// sed -E 's#//[^@]*@#//***@#'` -- gets the pipeline's last exit status, so a
+// failed push reads as success. PIPESTATUS is the usual recovery, and under
+// dash it is a parse error that aborts the command rather than a missing
+// feature, which is worse than the problem it was reached for.
+const hasBash = existsSync("/usr/bin/bash");
+
+test("defaults to /bin/sh when no shell is given", async () => {
+  const { runner, dispose } = fixture();
+  try {
+    const handle = runner.exec("printf '%s' \"$0\"");
+    const events = await drain(handle.events);
+    const stdout = events
+      .filter((event) => event.name === "stdout")
+      .map((event) => decode(event.value as Uint8Array))
+      .join("");
+    expect(stdout).toBe("/bin/sh");
+  } finally {
+    dispose();
+  }
+});
+
+test.skipIf(!hasBash)("runs commands under an explicitly chosen shell", async () => {
+  const { runner, dispose } = fixture({ shell: "/usr/bin/bash" });
+  try {
+    const handle = runner.exec("printf '%s' \"$0\"");
+    const events = await drain(handle.events);
+    const stdout = events
+      .filter((event) => event.name === "stdout")
+      .map((event) => decode(event.value as Uint8Array))
+      .join("");
+    expect(stdout).toBe("/usr/bin/bash");
+  } finally {
+    dispose();
+  }
+});
+
+test.skipIf(!hasBash)("a chosen shell resolves PIPESTATUS instead of aborting", async () => {
+  const { runner, dispose } = fixture({ shell: "/usr/bin/bash" });
+  try {
+    // false | true leaves $? as true's 0 while the first pipeline stage's real
+    // failure survives in the PIPESTATUS array. The trailing marker proves the
+    // command was not aborted: under dash the expansion is fatal and "after"
+    // never prints. The expansion is assembled from parts so its braces are
+    // not linted as a JavaScript template placeholder.
+    const first = ['"$', "{PIPESTATUS[0]}", '"'].join("");
+    const handle = runner.exec(`false | true; printf '[%s]' ${first}; printf "after"`);
+    const events = await drain(handle.events);
+    const stdout = events
+      .filter((event) => event.name === "stdout")
+      .map((event) => decode(event.value as Uint8Array))
+      .join("");
+    expect(stdout).toBe("[1]after");
+  } finally {
+    dispose();
+  }
+});
+
+test("rejects a shell that is not an absolute path", () => {
+  const storage = new SQLiteTestStorage();
+  const db = new Database(storage);
+  initializeSchema(db, () => Date.now());
+  try {
+    expect(() => new Runner({ db, shell: "bash" })).toThrow(/absolute path/);
+  } finally {
+    storage.close?.();
   }
 });

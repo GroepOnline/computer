@@ -57,3 +57,14 @@ xcuserdata/
 *.xcuserstate
 *.xccheckout
 *.xcscmblueprint
+*.xcodeproj/
+*.xcworkspace/
+*.ipa
+*.dSYM
+*.dSYM.zip
+Pods/
+
+# Local env
+.env
+.env.local
+.env.*.local

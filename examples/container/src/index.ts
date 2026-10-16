@@ -1,11 +1,19 @@
 // Example Worker + container-enabled Durable Object that runs a
-// Workspace inside a Cloudflare Container.
+// Workspace inside a container the Durable Object schedules itself.
 //
-// The DO is a thin shell over CloudflareContainerBackend: it picks
-// the container (this.ctx.container) and the egress fetcher
+// The DO is a thin shell over ContainerBackend: it picks the container
+// (this.ctx.container) and the egress fetcher
 // (ctx.exports.WorkspaceProxy bound to this DO instance), forwards
-// container-bound /ws upgrades back through the backend, and
+// container-bound /api upgrades back through the backend, and
 // otherwise just calls into a single Workspace instance.
+//
+// What distinguishes this example from examples/container-legacy is
+// the scheduling policy. The wrangler containers block here sets
+// `scheduling_policy: "durable_object"`, which hands the container
+// lifecycle to this object and takes image selection and sizing with
+// it: the block rejects `instance_type`, and it prepares an `images`
+// map for the object to choose from. So the backend below names both,
+// and every start() it issues carries them.
 //
 // Wire shape:
 //
@@ -14,7 +22,7 @@
 //              ▼
 //        ContainerExample DO ──► Container ──► computerd (:8080)
 //              ▲                                │
-//              │  ws://computer.internal/ws    │
+//              │  ws://computer.internal/api   │
 //              └─── capnweb session ◀─────────────┘
 
 import { DurableObject, tracing } from "cloudflare:workers";
@@ -22,15 +30,11 @@ import { DurableObject, tracing } from "cloudflare:workers";
 import {
   type DurableObjectStorageLike,
   getWorkspace,
-  R2Bucket,
   type WorkspaceOptions,
   WorkspaceProxy,
   withWorkspace,
 } from "@cloudflare/computer";
-import {
-  CloudflareContainerBackend,
-  withWorkspaceContainer,
-} from "@cloudflare/computer/backends/container";
+import { ContainerBackend, withWorkspaceContainer } from "@cloudflare/computer/backends/container";
 import { createCloudflareObserver } from "@cloudflare/computer/observe/cloudflare";
 
 // Re-export so the runtime can build a loopback binding for the
@@ -49,9 +53,22 @@ export { WorkspaceProxy };
 // while constructing the Workspace: base-class fields are initialized
 // by the time the callback runs, subclass fields are not.
 class ContainerBase extends withWorkspaceContainer(class extends DurableObject<Env> {}) {
-  readonly backend = new CloudflareContainerBackend({
+  readonly backend = new ContainerBackend({
     container: () => this,
     workspace: { binding: "ContainerExample", id: this.ctx.id.toString() },
+    egress: { mode: "direct" },
+    // Key into `ctx.container.images`, which wrangler populates from
+    // the `images` map in wrangler.jsonc. "app" is the default, so
+    // this line is redundant here and is kept to show where the name
+    // comes from: it is the images key, not the container application
+    // name that sits beside it in the same block.
+    name: "app",
+    // Requested at launch because the containers block cannot declare
+    // it under this policy. Omitting it lets the platform choose,
+    // which is rarely right for a workload that compiles or installs
+    // packages -- the named tiers top out at 4 vCPU / 12 GiB, and a
+    // custom size is the only way past that.
+    instance: "standard-2",
   });
 }
 
@@ -60,24 +77,16 @@ class ContainerBase extends withWorkspaceContainer(class extends DurableObject<E
 // DurableObject keeps ctx and env protected, so read them through a
 // cast the way the mixin's own docs do.
 function workspaceOptions(self: InstanceType<typeof ContainerBase>): WorkspaceOptions {
-  const { ctx, env } = self as unknown as { ctx: DurableObjectState; env: Env };
+  const { ctx } = self as unknown as { ctx: DurableObjectState; env: Env };
   return {
     // ctx.storage.sql.exec returns a narrower row type than
     // DurableObjectStorageLike declares; the runtime shape
     // matches. Cast through unknown to bypass invariance.
     storage: ctx.storage as unknown as DurableObjectStorageLike,
     backends: [self.backend],
-    // Mount the Bucket binding at /workspace/r2. Seed it with
-    // `npm run seed:r2` (uploads ./seed/data/hello.txt) so the
-    // first read returns "hello world". The bucket is read-only;
-    // writes through Workspace.fs under /workspace/r2 reject
-    // with EROFS.
-    mounts: {
-      "/workspace/r2": R2Bucket(env.Bucket),
-    },
     // Route every workspace operation through the Cloudflare
     // runtime's user-tracing surface. The runtime owns the span
-    // lifecycle; the observer is a thin facade that forwards seed
+    // lifecycle; the observer is a thin wrapper that forwards seed
     // attributes and a `setAttribute` callback. With
     // `observability.traces.enabled = true` in wrangler.jsonc, the
     // spans show up in the Workers Observability dashboard
@@ -91,7 +100,7 @@ function workspaceOptions(self: InstanceType<typeof ContainerBase>): WorkspaceOp
 // hands back round-trip into this DO; the actual SyncRPC + ShellRPC
 // traffic stays on the computerd ↔ DO capnweb wire.
 export class ContainerExample extends withWorkspace(ContainerBase, workspaceOptions) {
-  // ---- WebSocket: computerd's outbound /ws upgrade ---------------------
+  // ---- WebSocket: computerd's outbound /api upgrade --------------------
 
   override async fetch(request: Request): Promise<Response> {
     return this.backend.handleFetch(request);
@@ -182,6 +191,7 @@ async function handleFile(
   if (request.method === "PUT") {
     const body = new Uint8Array(await request.arrayBuffer());
     try {
+      await ws.fs.mkdir(MOUNT_ROOT, { recursive: true });
       await ws.fs.writeFile(path, body);
       return new Response(null, { status: 204 });
     } catch (error) {

@@ -6,10 +6,11 @@ PLAN.md
 # tracked code and must not be caught by this rule.
 /artifacts/
 
-# Generated bundle for the worker backend's ShellWorker. Built
-# by packages/computer/src/backends/worker/script/build-bundle.mjs
-# on prepare / pretest / pretypecheck.
-packages/computer/src/backends/worker-shell/generated-bundle.ts
+# Generated shell-module groups for the worker backend's
+# ShellWorker (core plus one file per optional feature). Built by
+# packages/computer/src/backends/worker-shell/script/build-bundle.mjs on
+# prepare / pretest / pretypecheck.
+packages/computer/src/backends/worker-shell/generated/
 
 # SEA binary destinations populated at publish time from
 # artifacts/computerd/ via the build-bin step. The @cloudflare/computer
@@ -17,6 +18,23 @@ packages/computer/src/backends/worker-shell/generated-bundle.ts
 # blanket dist/ rule above; listed here for discoverability.
 packages/computer-computerd-*/bin/computerd
 packages/computer/dist/bin/computerd-*
+
+# Worker binding types, generated per example by `wrangler types`
+# from wrangler.jsonc plus the example's committed env template. The
+# build:types script in each example's package.json writes this file,
+# and the repo-root postinstall hook runs those scripts, so a fresh
+# `npm install` produces every copy.
+worker-configuration.d.ts
+
+# Local secrets for `wrangler dev`. Examples document putting
+# Cloudflare API credentials in .dev.vars files that wrangler reads
+# from the example directory; they must never be committed.
+.dev.vars
+**/.dev.vars
+
+# Local celld example state.
+examples/celld/.celld-s3*/
+examples/celld/.celld-state*/
 
 # ChefGroep standard ignores (OS / Xcode / local env / CE)
 .compound-engineering/*.local.yaml

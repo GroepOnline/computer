@@ -1,6 +1,6 @@
 {
   "name": "@cloudflare/computer-rpc",
-  "version": "0.0.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "exports": {
@@ -31,14 +31,23 @@
     "build": "tsc -p tsconfig.build.json",
     "pretypecheck": "npm run build --workspace @cloudflare/dofs",
     "typecheck": "tsc -p tsconfig.build.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "bench": "vitest run --config vitest.config.bench.ts"
   },
   "dependencies": {
     "@cloudflare/dofs": "*",
-    "capnweb": "^0.8.0"
+    "capnweb": "^0.10.0"
+  },
+  "peerDependencies": {
+    "@cloudflare/workers-types": "^4.20260616.1 || ^5.20260921.1"
+  },
+  "peerDependenciesMeta": {
+    "@cloudflare/workers-types": {
+      "optional": true
+    }
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260616.1",
+    "@cloudflare/workers-types": "^4.20260616.1 || ^5.20260921.1",
     "@types/ws": "^8.18.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.11",

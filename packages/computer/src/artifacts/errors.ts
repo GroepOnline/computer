@@ -1,5 +1,7 @@
-// Typed error hierarchy for the session-scoped artifacts surface.
-//
+// Typed error hierarchy for the artifacts surface.
+
+export const ARTIFACTS_NOT_CONFIGURED_MESSAGE = "Workspace Artifacts binding is not configured";
+
 // The CLI dispatcher in `cli.ts` maps each class to a
 // deterministic exit code and a stderr line so a shell consumer
 // can match on the text. The hierarchy is deliberately narrow:
@@ -35,6 +37,11 @@ export class InvalidRepoNameError extends ArtifactError {
  * Raised when a session id is empty or contains a path separator.
  * A session id becomes the leading segment of every scoped name,
  * so it has the same shape constraints as a repo name.
+ *
+ * An empty id is an error rather than a way to ask for a client
+ * without a session. That is what omitting the id does, and an id
+ * that came out empty by accident should not silently widen a
+ * client from one session to the whole namespace.
  */
 export class InvalidSessionIdError extends ArtifactError {
   constructor(sessionId: string, reason: string, options?: { cause?: unknown }) {

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { isWorkspaceTransportFailure, WorkspaceTransportError } from "./transport-failure.js";
+import {
+  isWorkspacePreDispatchTransportFailure,
+  isWorkspaceTransportFailure,
+  WorkspacePreDispatchTransportError,
+  WorkspaceTransportError,
+} from "./transport-failure.js";
 
 describe("isWorkspaceTransportFailure", () => {
   it("recognises WorkspaceTransportError instances", () => {
@@ -16,6 +21,42 @@ describe("isWorkspaceTransportFailure", () => {
     expect(
       isWorkspaceTransportFailure(
         new Error("Attempted to use RPC stub after it has been disposed."),
+      ),
+    ).toBe(true);
+  });
+
+  it("only treats a locally disposed stub as proof that dispatch did not start", () => {
+    expect(
+      isWorkspacePreDispatchTransportFailure(
+        new Error("Attempted to use RPC stub after it has been disposed."),
+      ),
+    ).toBe(true);
+    expect(
+      isWorkspacePreDispatchTransportFailure(
+        new Error("RPC was canceled because RPC session was shut down"),
+      ),
+    ).toBe(false);
+    expect(isWorkspacePreDispatchTransportFailure(new Error("WebSocket closed unexpectedly"))).toBe(
+      false,
+    );
+  });
+
+  it("recognises an explicitly pre-dispatch transport failure", () => {
+    const error = new WorkspacePreDispatchTransportError("pre-exec push failed");
+    expect(isWorkspaceTransportFailure(error)).toBe(true);
+    expect(isWorkspacePreDispatchTransportFailure(error)).toBe(true);
+
+    const cloned = new Error(error.message);
+    cloned.name = error.name;
+    expect(isWorkspaceTransportFailure(cloned)).toBe(true);
+    expect(isWorkspacePreDispatchTransportFailure(cloned)).toBe(true);
+  });
+
+  it("walks causes when classifying a pre-dispatch failure", () => {
+    const inner = new Error("Attempted to use RPC stub after it has been disposed.");
+    expect(
+      isWorkspacePreDispatchTransportFailure(
+        new WorkspaceTransportError("shell unavailable", { cause: inner }),
       ),
     ).toBe(true);
   });

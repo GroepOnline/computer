@@ -15,20 +15,29 @@ import {
   assertAppliedPushCursor,
   type ChangeCursor,
   type ChangeEntry,
-  coalesceChanges,
   compareChangeCursors,
-  currentRev,
   type Database,
   hasObjects,
   readFetchCursor,
+  readPushCursor,
   readWatermark,
   type SkippedEntry,
   stageBlob,
   writeFetchCursor,
+  writePushCursor,
   writeWatermark,
 } from "@cloudflare/dofs";
 
 import type { SyncRPC } from "./interface.js";
+
+// The restartable engine ships through the same ./driver entry point.
+// Explicit-cursor block helpers below remain the low-level surface for
+// callers that own their own destination store and checkpoint; the
+// engine is what the Workspace iterables are built on.
+import { captureSyncTarget, pullBlocks, pushBlocks } from "./sync-engine.js";
+
+export type { PullBlocksOptions, PushBlocksOptions, SyncProgress } from "./sync-engine.js";
+export { captureSyncTarget, pullBlocks, pushBlocks };
 
 function hex(bytes: Uint8Array): string {
   let s = "";
@@ -71,9 +80,6 @@ export async function pullOnce(
   remote: SyncRPC,
   backend?: string,
 ): Promise<ApplyResult> {
-  // Delegate to the inner implementation with retried=false. See
-  // pullOnceImpl for the fetchChanges round trip, invariant check,
-  // reset-and-retry path, and batched apply loop.
   return pullOnceImpl(db, remote, backend, false);
 }
 
@@ -278,9 +284,6 @@ function cursorComplete(after: ChangeCursor, current: ChangeCursor): boolean {
 }
 
 function writeFetchCursorIfAhead(db: Database, cursor: ChangeCursor, backend?: string): void {
-  // Overlapping pulls can complete out of order, so checkpoint writes
-  // compare against the latest persisted cursor instead of the value
-  // observed when this pull started.
   if (compareChangeCursors(cursor, readFetchCursor(db, backend)) > 0) {
     writeFetchCursor(db, cursor, backend);
   }
@@ -289,78 +292,16 @@ function writeFetchCursorIfAhead(db: Database, cursor: ChangeCursor, backend?: s
 // Push every entry the local store has produced since the last
 // successful push. The wire shape mirrors pullOnce in reverse:
 // stage bytes the remote lacks, then push the entry stream.
+// Drains to completion, so callers that need the whole local window
+// shipped before a command starts get one awaitable call. Restartable
+// push lives in pushBlocks; this is the in-band bracket.
 export async function pushOnce(db: Database, remote: SyncRPC, backend?: string): Promise<number> {
-  const sincePush = readWatermark(db, "pushRev", backend);
-  const localRev = currentRev(db);
-  if (localRev <= sincePush) return 0;
-
-  const entries: ChangeEntry[] = [];
-  const wantedHashes: Uint8Array[] = [];
-  const seenHash = new Set<string>();
-  for await (const e of coalesceChanges(db, { rev: sincePush, path: null })) {
-    entries.push(e);
-    if (e.kind === "file") {
-      for (const c of e.chunks) {
-        const k = hex(c.hash);
-        if (!seenHash.has(k)) {
-          seenHash.add(k);
-          wantedHashes.push(c.hash);
-        }
-      }
-    }
+  let pushed = 0;
+  for await (const progress of pushBlocks(db, remote, backend === undefined ? {} : { backend })) {
+    pushed += progress.entries;
+    if (progress.complete) break;
   }
-  if (entries.length === 0) return 0;
-
-  // Probe the remote for the chunks it already holds; ship the
-  // complement.
-  const remoteHas = new Set<string>();
-  if (wantedHashes.length > 0) {
-    const have = await remote.hasObjects(wantedHashes);
-    for (const h of have) remoteHas.add(hex(h));
-  }
-  const missing = wantedHashes.filter((h) => !remoteHas.has(hex(h)));
-
-  if (missing.length > 0) {
-    const local = (function* () {
-      for (const h of missing) {
-        const row = db.one<{ bytes: Uint8Array }>(
-          "SELECT bytes FROM vfs_blob_bytes WHERE hash = ?",
-          h,
-        );
-        if (row === undefined) {
-          throw new Error(`pushOnce: missing local blob ${hex(h)}`);
-        }
-        yield { hash: h, bytes: row.bytes };
-      }
-    })();
-    const bytesStream = new ReadableStream<{ hash: Uint8Array; bytes: Uint8Array }>({
-      pull(controller) {
-        const next = local.next();
-        if (next.done) controller.close();
-        else controller.enqueue(next.value);
-      },
-    });
-    await remote.pushObjects(bytesStream);
-  }
-
-  const entryStream = new ReadableStream<ChangeEntry>({
-    start(controller) {
-      for (const e of entries) controller.enqueue(e);
-      controller.close();
-    },
-  });
-  const response = await remote.push({ senderRev: localRev, changes: entryStream });
-
-  // Cross-side invariant: the receiver must echo back a cursor that
-  // covers the rev we just claimed to push. A drift means the apply
-  // path lost data, or a stale receiver is serving an old snapshot.
-  // Tear down loudly rather than corrupt watermarks.
-  assertAppliedPushCursor(response.appliedPushCursor, { rev: localRev, path: null });
-
-  // Local pushRev advances to the rev we observed at the start of
-  // this round. Anything written after that gets caught next tick.
-  writeWatermark(db, "pushRev", localRev, backend);
-  return entries.length;
+  return pushed;
 }
 
 // One full tick: pull, then push. The order matters \u2014 pulling
@@ -400,7 +341,7 @@ export async function reconcileWatermarks(
 ): Promise<{ fetchRevReset: boolean; pushRevReset: boolean }> {
   const remoteWatermarks = await remote.watermarks();
   const localFetchCursor = readFetchCursor(db, backend);
-  const localPushRev = readWatermark(db, "pushRev", backend);
+  const localPushCursor = readPushCursor(db, backend);
 
   let fetchRevReset = false;
   let pushRevReset = false;
@@ -426,8 +367,8 @@ export async function reconcileWatermarks(
   // (e.g. the container side of a DO↔container backend), which would
   // make every reconcile spuriously reset pushRev and force a full
   // re-push on every reconnect.
-  if (remoteWatermarks.fetchCursor.rev < localPushRev) {
-    writeWatermark(db, "pushRev", 0, backend);
+  if (compareChangeCursors(remoteWatermarks.fetchCursor, localPushCursor) < 0) {
+    writePushCursor(db, { rev: 0, path: null }, backend);
     pushRevReset = true;
   }
 

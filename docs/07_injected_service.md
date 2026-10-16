@@ -21,8 +21,8 @@ npm run build:bin --workspace @cloudflare/computerd
 # → artifacts/computerd/computerd-macos-x64
 ```
 
-`examples/container/Dockerfile` is the canonical recipe for
-staging the binary into a container image.
+`examples/container/Dockerfile` is the canonical recipe for staging the
+binary into a container image.
 
 ## Responsibilities
 
@@ -32,9 +32,8 @@ staging the binary into a container image.
    same paths. The backend is picked by `FUSE_MOUNT` (default `auto`,
    see the env-var table below).
 2. **Dirty tracking.** Writes that flow through FUSE land in the
-   in-container VFS database; sync (when `UPSTREAM_URL` is set) is
-   what surfaces those revisions back out. See doc 02 for the sync
-   protocol.
+   in-container VFS database; the host pulls those revisions back out
+   across the capnweb session. See doc 02 for the sync protocol.
 3. **Exec.** Runs shell commands and streams stdout/stderr back over
    capnweb. See [05. Shell Interface](./05_runtime_interface.md).
 4. **Apply.** Accepts changes pushed by the DO and writes them into
@@ -50,12 +49,16 @@ backend pins it to `8080`) and serves:
 
 | Route | Method | Purpose |
 | --- | --- | --- |
-| `/health` | `GET`, `HEAD` | Liveness probe; `200 ok\n` as soon as the HTTP server binds. |
+| `/health` | `GET`, `HEAD` | Liveness probe; `200 ok\n` as soon as the HTTP server binds. The only route reachable without the shared secret. |
 | `/__computerd/info` | `GET` | Runtime info: FUSE backend, mount point, port. |
-| `/api` | `POST` | HTTP-batch capnweb transport. |
-| `/ws` | `GET` (upgrade) | WebSocket capnweb transport — the bootstrap stub is `WorkspaceRPC`. |
-| `/connect` | `POST` | Tells `computerd` to dial *out* to a caller-supplied URL and serve a `WorkspaceRPC` session over that outbound WebSocket. Used by the Cloudflare backend (see below). |
+| `/api` | `GET` (upgrade) | WebSocket capnweb transport — the bootstrap stub is `WorkspaceRPC`. Only the exact path upgrades. A request without an `Upgrade` header gets `400`; an unsupported `Sec-WebSocket-Version` gets `426` and the versions the server speaks. |
+| `/api/watermarks` | `GET`, `HEAD` | Sync revisions: `currentRev`, `pushRev`, `fetchCursor`. The same values `sync.watermarks()` returns, for callers that want a few numbers without holding a session. |
+| `/connect` | `POST` | Tells `computerd` to dial *out* to a caller-supplied endpoint and serve a `WorkspaceRPC` session over that outbound WebSocket. Used by the Cloudflare backend (see below). |
 | `/` | `GET` | Banner/info page. |
+
+`/api` is the workspace surface: the session itself, plus anything that
+reads through it. `/__computerd` is daemon introspection, which is why
+runtime info sits there and revisions do not.
 
 The capnweb bootstrap interface is **`WorkspaceRPC`** (defined in
 `packages/rpc/`), split into `sync` and `shell` sub-stubs.
@@ -108,48 +111,50 @@ Provider-agnostic shape — three steps, in order:
    path the mount is awaited *before* `listen`, so by the time
    `/health` answers FUSE is up too. With `FUSE_MOUNT=none` there is
    no FUSE step at all.
-3. **Open the capnweb session.** Either the host upgrades to `/ws`
-   directly, or it asks `computerd` (via `POST /connect`) to dial *out* to a
-   URL it controls and serve the session over that outbound socket.
+3. **Open the capnweb session.** Either the host upgrades to `/api`
+   directly, or it asks `computerd` (via `POST /connect`) to dial *out* to an
+   endpoint it controls and serve the session over that outbound socket.
    Either way, the bootstrap stub is `WorkspaceRPC`.
 
 ### Cloudflare Containers specifics
 
-`CloudflareContainerBackend` (`packages/computer/src/backends/container/cloudflare-container.ts`)
-wires it like this:
+Cloudflare Computer has one backend for each container scheduling policy.
 
-1. **Start.** `container.start({ enableInternet, env })` on the
-   Cloudflare Containers API — not the `@cloudflare/sandbox` SDK.
-   Idempotence comes from `container.running` plus a cached `#handle`;
-   there is no process-name registry, no `startProcess`/`getProcess`,
-   and no `node /app/...` command (the container's `ENTRYPOINT` runs
-   `computerd` directly). `containerEnv` pins `PORT=8080` and lets the
-   image's own `FUSE_MOUNT` value (typically `auto`) win.
+`ContainerBackend` is the default. It works with containers that the durable
+object schedules, configured with `scheduling_policy: "durable_object"` and
+an `images` map. Each launch selects an image from
+`ctx.container.images`. The backend can also request an `instance` size and
+pass options such as `entrypoint`, `labels`, and snapshot settings to
+`container.start()`.
+
+`LegacyContainerBackend` works with containers that the platform schedules.
+The containers block chooses the image and instance size, so this backend
+passes only the environment and internet setting when it starts the
+container.
+
+Both backends use the same connection flow:
+
+1. **Start the container.** The image's `ENTRYPOINT` runs `computerd`
+   directly. The backend sets `PORT=8080`, preserves the image's
+   `FUSE_MOUNT` setting, and adds `RPC_CLIENT_SECRET`. It records the launch
+   settings so it can reject or replace a running container with the wrong
+   configuration.
 2. **Wire egress.** `container.interceptOutboundHttp(egressHost, egress)`
-   routes outbound HTTP from the container at `egressHost` back to a
-   Worker `Fetcher` the DO controls.
-3. **Probe.** `container.getTcpPort(containerPort).fetch("/health", { method: "HEAD" })`,
-   repeated until it returns `200`.
-4. **Invert the WebSocket.** The DO arms an upgrade slot
-   (`#armUpgrade`) and then `POST`s to `/connect` on the container
-   (`#postConnect`). `computerd` reads that request and dials *out* to the
-   egress at `${egressHost}/ws`. Because the egress is intercepted,
-   that outbound dial loops back to the DO's `handleFetch()`, which
-   accepts the upgrade and resolves the in-flight `#pendingUpgrade`.
-   The capnweb session then runs over that socket. **The WebSocket
-   carrier is inverted** versus a naive "host dials into container"
-   model.
+   routes outbound HTTP from the container back to a Worker `Fetcher` owned
+   by the durable object.
+3. **Probe health.** The backend sends `HEAD /health` through the
+   container's TCP port until `computerd` responds.
+4. **Open the WebSocket.** The backend prepares an upgrade slot before it
+   posts to `/connect`. `computerd` then dials the intercepted egress URL,
+   which routes the upgrade back to `handleFetch()`. The capnweb session
+   runs over that WebSocket.
 
-Sharp edges actually present in `cloudflare-container.ts`:
-
-- `#armUpgrade` must be set up *before* `#postConnect`, because `computerd`
-  can dial back before the `POST /connect` response returns.
-- A `#monitoring` flag watches container exit and drops the cached
-  handle so the next call rebuilds from scratch.
-- **No transparent reconnect after a mid-session drop.** If the
-  WebSocket dies, the caller is expected to reconstruct the
-  `Workspace` rather than the backend trying to splice a new socket
-  into the existing session.
+A reconnect creates a complete new session. If the WebSocket closes,
+`Workspace` drops the old backend handle and calls the selected backend's
+`connect()` method again. The replacement starts or adopts the container,
+checks health, and repeats the `/connect` handshake. Sync and process
+lifecycle operations get one retry when replay is safe. A command is only
+retried when the request was not dispatched.
 
 ## Environment variables
 
@@ -158,11 +163,12 @@ These are the variables `computerd` actually consumes (see
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `PORT` | `45678` | Port the HTTP/WS server listens on. CF backend pins this to `8080`. |
+| `PORT` | `45678` | Port the HTTP server listens on. CF backend pins this to `8080`. |
 | `MOUNT_POINT` | `/workspace` | Absolute path inside the container to mount the FUSE filesystem at. Ignored when `FUSE_MOUNT=none`. |
 | `FUSE_MOUNT` | `auto` | Backend selector: `auto` probes `/dev/fuse` (linux) or macFUSE (darwin) and falls back to the userspace shim; `fuse` / `macfuse` require the corresponding real backend; `shim` forces the userspace shim; `none` skips the mount entirely. |
-| `UPSTREAM_URL` | unset | If set, `computerd` starts a sync client against this URL to push/pull VFS revisions. |
 | `EXEC_LOG_MAX_BYTES` | runner default | Caps the per-exec stdout/stderr log retained in-memory. |
+| `RPC_CLIENT_SECRET` | unset | When set, every route except `/health` requires it as `Authorization: Bearer <secret>`, including the `/api` upgrade. Unset leaves the surface open. The Cloudflare backend generates one per workspace and sets it at launch. |
+| `COMPUTER_VAR_*` | unset | Forwarded into every `shell.exec` command with the prefix stripped, so `COMPUTER_VAR_NODE_ENV` arrives as `NODE_ENV`. |
 | `LOG_FILE` | unset | If set, every `console.log` / `console.error` line and any `uncaughtException` / `unhandledRejection` is also appended to this file. Stdout/stderr behaviour is unchanged. |
 
 When `LOG_FILE` is set, `computerd` mirrors console output into the file in
@@ -196,17 +202,9 @@ Today:
 
 ## Lifetime
 
-The `computerd` process is long-lived and outlives DO restarts — the
-sandbox container is reaped only when its lifetime policy says so,
-and a fresh DO incarnation reconnects to the same running daemon over
-a new WebSocket (the Cloudflare backend's `#monitoring` flag drops the
-cached handle if the container itself exits, forcing a rebuild).
+The `computerd` process is long-lived and outlives Durable Object restarts — the sandbox container is reaped only when its lifetime policy says so, and a fresh Durable Object incarnation reconnects to the same running daemon over a new WebSocket. The container monitor and transport error classifier drop stale handles so an operation can reconnect through the readiness gate.
 
-Caveat: **no on-disk persistence yet** (`packages/computerd/README.md`).
-The "same in-memory VFS across DO restarts" picture only holds while
-the container process is alive. A container restart loses VFS state;
-sync via `UPSTREAM_URL` is what brings state back across container
-restarts.
+Caveat: **no on-disk persistence yet** (`packages/computerd/README.md`). The same in-memory VFS across Durable Object restarts only holds while the container process is alive. A container restart loses VFS state. Watermark reconciliation and the next push rebuild the mirror from Durable Object storage, but reconnect cannot recover container-local files that were never pulled before the process died.
 
 ## Open questions
 

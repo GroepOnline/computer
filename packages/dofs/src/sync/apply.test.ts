@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+
+import { describe, expect, it, vi } from "vitest";
 
 import { link } from "../fs/link.js";
 import { mkdir } from "../fs/mkdir.js";
@@ -10,8 +12,9 @@ import { resolveInode } from "../fs/resolve.js";
 import { rm } from "../fs/rm.js";
 import { symlink } from "../fs/symlink.js";
 import { withDB, withTwoDBs } from "../fs/with-db.js";
-import { writeFile, writeFileSync } from "../fs/writeFile.js";
+import { CHUNK_SIZE, writeFile, writeFileSync } from "../fs/writeFile.js";
 import { applyChanges, applyChangesSync } from "./apply.js";
+import { stageBlob } from "./blobs.js";
 import type { ChangeEntry } from "./changes.js";
 import { coalesceChanges } from "./coalesce.js";
 import { fetchObjects } from "./fetch.js";
@@ -71,6 +74,480 @@ describe("applyChanges", () => {
         expect(await readFile(b, "/b.txt", "utf8")).toBe("beta");
       },
     );
+  });
+
+  describe.each(["async", "sync"] as const)("%s apply", (mode) => {
+    const apply = async (db: import("../storage.js").Database, entries: ChangeEntry[]) => {
+      if (mode === "sync") {
+        return applyChangesSync(db, entries, new Map(), { source: "upstream" });
+      }
+      return applyChanges(db, entries, new Map(), { source: "upstream" });
+    };
+
+    it("creates missing parents before applying a file", async () => {
+      await withDB(async (db) => {
+        await apply(db, [
+          {
+            kind: "file",
+            rev: 4,
+            path: "/workspace/newdir/file.txt",
+            mode: 0o640,
+            mtime: 4,
+            size: 0,
+            chunks: [],
+          },
+          { kind: "dir", rev: 8, path: "/workspace/newdir", mode: 0o700, mtime: 8 },
+          { kind: "dir", rev: 9, path: "/workspace", mode: 0o750, mtime: 9 },
+        ]);
+
+        expect(await readFile(db, "/workspace/newdir/file.txt", "utf8")).toBe("");
+        expect(resolveInode(db, "/workspace", { followSymlinks: false })).toMatchObject({
+          type: "dir",
+          mode: 0o750,
+        });
+        expect(resolveInode(db, "/workspace/newdir", { followSymlinks: false })).toMatchObject({
+          type: "dir",
+          mode: 0o700,
+        });
+      });
+    });
+
+    it("creates missing parents before applying a symlink", async () => {
+      await withDB(async (db) => {
+        await apply(db, [
+          {
+            kind: "symlink",
+            rev: 4,
+            path: "/workspace/newdir/link",
+            target: "../target",
+            mode: 0o777,
+            mtime: 4,
+          },
+          { kind: "dir", rev: 8, path: "/workspace/newdir", mode: 0o700, mtime: 8 },
+          { kind: "dir", rev: 9, path: "/workspace", mode: 0o750, mtime: 9 },
+        ]);
+
+        expect(readlink(db, "/workspace/newdir/link")).toBe("../target");
+        expect(resolveInode(db, "/workspace", { followSymlinks: false })).toMatchObject({
+          type: "dir",
+          mode: 0o750,
+        });
+        expect(resolveInode(db, "/workspace/newdir", { followSymlinks: false })).toMatchObject({
+          type: "dir",
+          mode: 0o700,
+        });
+      });
+    });
+
+    it.each(["file", "symlink"] as const)(
+      "replaces a blocking %s ancestor before applying a file",
+      async (kind) => {
+        await withDB(async (db) => {
+          if (kind === "file") {
+            await writeFile(db, "/workspace", "old", {}, () => 1);
+          } else {
+            mkdir(db, "/target", {}, () => 1);
+            await writeFile(db, "/target/keep.txt", "keep", {}, () => 2);
+            symlink(db, "/target", "/workspace", () => 3);
+          }
+
+          await apply(db, [
+            {
+              kind: "file",
+              rev: 4,
+              path: "/workspace/newdir/file.txt",
+              mode: 0o640,
+              mtime: 4,
+              size: 0,
+              chunks: [],
+            },
+            { kind: "dir", rev: 8, path: "/workspace/newdir", mode: 0o700, mtime: 8 },
+            { kind: "dir", rev: 9, path: "/workspace", mode: 0o750, mtime: 9 },
+          ]);
+
+          expect(await readFile(db, "/workspace/newdir/file.txt", "utf8")).toBe("");
+          expect(resolveInode(db, "/workspace", { followSymlinks: false })).toMatchObject({
+            type: "dir",
+            mode: 0o750,
+          });
+          expect(resolveInode(db, "/workspace/newdir", { followSymlinks: false })).toMatchObject({
+            type: "dir",
+            mode: 0o700,
+          });
+          if (kind === "symlink") {
+            expect(await readFile(db, "/target/keep.txt", "utf8")).toBe("keep");
+          }
+        });
+      },
+    );
+
+    it("writes a file through a reachable symlink parent", async () => {
+      await withDB(async (db) => {
+        mkdir(db, "/target", {}, () => 1);
+        await writeFile(db, "/target/keep.txt", "keep", {}, () => 2);
+        symlink(db, "/target", "/workspace", () => 3);
+
+        await apply(db, [
+          {
+            kind: "file",
+            rev: 4,
+            path: "/workspace/new.txt",
+            mode: 0o640,
+            mtime: 4,
+            size: 0,
+            chunks: [],
+          },
+        ]);
+
+        expect(resolveInode(db, "/workspace", { followSymlinks: false })?.type).toBe("symlink");
+        expect(readlink(db, "/workspace")).toBe("/target");
+        expect(await readFile(db, "/workspace/keep.txt", "utf8")).toBe("keep");
+        expect(await readFile(db, "/target/new.txt", "utf8")).toBe("");
+      });
+    });
+
+    it("creates a directory through a reachable symlink parent", async () => {
+      await withDB(async (db) => {
+        mkdir(db, "/target", {}, () => 1);
+        await writeFile(db, "/target/keep.txt", "keep", {}, () => 2);
+        symlink(db, "/target", "/workspace", () => 3);
+
+        await apply(db, [
+          { kind: "dir", rev: 4, path: "/workspace/newdir", mode: 0o700, mtime: 4 },
+        ]);
+
+        expect(resolveInode(db, "/workspace", { followSymlinks: false })?.type).toBe("symlink");
+        expect(readlink(db, "/workspace")).toBe("/target");
+        expect(await readFile(db, "/workspace/keep.txt", "utf8")).toBe("keep");
+        expect(resolveInode(db, "/target/newdir", { followSymlinks: false })).toMatchObject({
+          type: "dir",
+          mode: 0o700,
+        });
+      });
+    });
+
+    it("creates a symlink through a reachable symlink parent", async () => {
+      await withDB(async (db) => {
+        mkdir(db, "/target", {}, () => 1);
+        await writeFile(db, "/target/keep.txt", "keep", {}, () => 2);
+        symlink(db, "/target", "/workspace", () => 3);
+
+        await apply(db, [
+          {
+            kind: "symlink",
+            rev: 4,
+            path: "/workspace/newlink",
+            target: "keep.txt",
+            mode: 0o777,
+            mtime: 4,
+          },
+        ]);
+
+        expect(resolveInode(db, "/workspace", { followSymlinks: false })?.type).toBe("symlink");
+        expect(readlink(db, "/workspace")).toBe("/target");
+        expect(await readFile(db, "/workspace/keep.txt", "utf8")).toBe("keep");
+        expect(readlink(db, "/target/newlink")).toBe("keep.txt");
+      });
+    });
+
+    it.each(["file", "symlink"] as const)(
+      "replaces a blocking %s ancestor when directories arrive child-first",
+      async (kind) => {
+        await withDB(async (db) => {
+          if (kind === "file") {
+            await writeFile(db, "/workspace", "old", {}, () => 1);
+          } else {
+            symlink(db, "/missing", "/workspace", () => 1);
+          }
+
+          await apply(db, [
+            { kind: "dir", rev: 8, path: "/workspace/newdir", mode: 0o700, mtime: 8 },
+            { kind: "dir", rev: 9, path: "/workspace", mode: 0o750, mtime: 9 },
+          ]);
+
+          expect(resolveInode(db, "/workspace", { followSymlinks: false })).toMatchObject({
+            type: "dir",
+            mode: 0o750,
+          });
+          expect(resolveInode(db, "/workspace/newdir", { followSymlinks: false })).toMatchObject({
+            type: "dir",
+            mode: 0o700,
+          });
+        });
+      },
+    );
+
+    it("keeps a blocking ancestor that protects a read-only mount", async () => {
+      await withDB(async (db) => {
+        mkdir(db, "/target/r2", { recursive: true }, () => 1);
+        symlink(db, "/target", "/workspace", () => 2);
+        db.run(
+          "INSERT INTO _vfs_mounts (root, kind, indexed, mode) VALUES (?, ?, 1, 'read-only')",
+          "/workspace/r2",
+          "test",
+        );
+        invalidateReadOnlyMountCache(db);
+
+        const result = await apply(db, [
+          {
+            kind: "file",
+            rev: 4,
+            path: "/workspace/newdir/file.txt",
+            mode: 0o640,
+            mtime: 4,
+            size: 0,
+            chunks: [],
+          },
+        ]);
+
+        expect(result.applied).toBe(0);
+        expect(result.skipped).toEqual([
+          {
+            path: "/workspace/newdir/file.txt",
+            mountRoot: "/workspace/r2",
+            op: "write",
+            reason: "read-only",
+          },
+        ]);
+        expect(resolveInode(db, "/workspace", { followSymlinks: false })?.type).toBe("symlink");
+        expect(readlink(db, "/workspace")).toBe("/target");
+        expect(resolveInode(db, "/workspace/r2")?.type).toBe("dir");
+        expect(resolveInode(db, "/workspace/newdir/file.txt")).toBeNull();
+      });
+    });
+
+    it("creates a missing ancestor of a read-only mount", async () => {
+      await withDB(async (db) => {
+        db.run(
+          "INSERT INTO _vfs_mounts (root, kind, indexed, mode) VALUES (?, ?, 1, 'read-only')",
+          "/workspace/r2",
+          "test",
+        );
+        invalidateReadOnlyMountCache(db);
+
+        const result = await apply(db, [
+          {
+            kind: "file",
+            rev: 4,
+            path: "/workspace/file.txt",
+            mode: 0o640,
+            mtime: 4,
+            size: 0,
+            chunks: [],
+          },
+          { kind: "dir", rev: 9, path: "/workspace", mode: 0o750, mtime: 9 },
+        ]);
+
+        expect(await readFile(db, "/workspace/file.txt", "utf8")).toBe("");
+        expect(resolveInode(db, "/workspace", { followSymlinks: false })?.type).toBe("dir");
+        expect(result.skipped).toContainEqual({
+          path: "/workspace",
+          mountRoot: "/workspace/r2",
+          op: "write",
+          reason: "read-only",
+        });
+      });
+    });
+  });
+
+  it("checks an existing parent chain in linear database reads", async () => {
+    await withDB(async (db) => {
+      const parentParts = Array.from({ length: 8 }, (_, index) => `d${index}`);
+      const parentPath = `/${parentParts.join("/")}`;
+      mkdir(db, parentPath, { recursive: true }, () => 1);
+
+      const all = vi.spyOn(db, "all");
+      try {
+        await applyChanges(
+          db,
+          [
+            {
+              kind: "file",
+              rev: 10,
+              path: `${parentPath}/file.txt`,
+              mode: 0o640,
+              mtime: 10,
+              size: 0,
+              chunks: [],
+            },
+          ],
+          new Map(),
+        );
+
+        const childLookups = all.mock.calls.filter(
+          ([query]) =>
+            query === "SELECT child_inode FROM vfs_dirents WHERE parent_inode = ? AND name = ?",
+        );
+        expect(childLookups.length).toBeLessThanOrEqual(2 * (parentParts.length + 1));
+      } finally {
+        all.mockRestore();
+      }
+    });
+  });
+
+  it("links staged chunks without reading payload bytes", async () => {
+    const content = `${"a".repeat(CHUNK_SIZE)}b`;
+    await withTwoDBs(
+      async (a) => {
+        await writeFile(a, "/large.txt", content, {}, () => 1);
+        const entries = await drain(coalesceChanges(a, 0));
+        const entry = entries.find((candidate) => candidate.path === "/large.txt");
+        if (entry?.kind !== "file") throw new Error("missing file entry");
+        expect(entry.chunks).toHaveLength(2);
+        return { entry, objects: await collectObjects(a, [entry]) };
+      },
+      async (b, { entry, objects }) => {
+        for (const chunk of entry.chunks) {
+          const bytes = objects.get(hex(chunk.hash));
+          if (bytes === undefined) throw new Error("missing chunk bytes");
+          stageBlob(b, chunk.hash, bytes, 2);
+        }
+
+        const all = vi.spyOn(b, "all");
+        try {
+          await applyChanges(b, [entry], new Map(), { source: "upstream" });
+          const payloadReads = all.mock.calls.filter(([query]) =>
+            query.includes("SELECT bytes FROM vfs_blob_bytes"),
+          );
+          expect(all.mock.calls.length).toBeGreaterThan(0);
+          expect(payloadReads).toHaveLength(0);
+        } finally {
+          all.mockRestore();
+        }
+        expect(await readFile(b, "/large.txt", "utf8")).toBe(content);
+      },
+    );
+  });
+
+  it("links staged chunks synchronously without reading payload bytes", async () => {
+    const content = `${"a".repeat(CHUNK_SIZE)}b`;
+    await withTwoDBs(
+      async (a) => {
+        await writeFile(a, "/large.txt", content, {}, () => 1);
+        const entries = await drain(coalesceChanges(a, 0));
+        const entry = entries.find((candidate) => candidate.path === "/large.txt");
+        if (entry?.kind !== "file") throw new Error("missing file entry");
+        expect(entry.chunks).toHaveLength(2);
+        return { entry, objects: await collectObjects(a, [entry]) };
+      },
+      async (b, { entry, objects }) => {
+        for (const chunk of entry.chunks) {
+          const bytes = objects.get(hex(chunk.hash));
+          if (bytes === undefined) throw new Error("missing chunk bytes");
+          stageBlob(b, chunk.hash, bytes, 2);
+        }
+
+        const all = vi.spyOn(b, "all");
+        try {
+          applyChangesSync(b, [entry], new Map(), { source: "upstream" });
+          const payloadReads = all.mock.calls.filter(([query]) =>
+            query.includes("SELECT bytes FROM vfs_blob_bytes"),
+          );
+          expect(all.mock.calls.length).toBeGreaterThan(0);
+          expect(payloadReads).toHaveLength(0);
+        } finally {
+          all.mockRestore();
+        }
+        expect(await readFile(b, "/large.txt", "utf8")).toBe(content);
+      },
+    );
+  });
+
+  it("rejects a file entry whose interior chunks are not chunk-aligned", async () => {
+    // Positional reads locate a chunk by dividing the offset by
+    // CHUNK_SIZE, so only the final chunk may be short. Linking a
+    // sender's chunk list verbatim has to enforce that.
+    await withDB(async (db) => {
+      const first = new TextEncoder().encode("first");
+      const second = new TextEncoder().encode("second");
+      const chunks = [first, second].map((bytes) => {
+        const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+        stageBlob(db, hash, bytes, 1000);
+        return { hash, size: bytes.byteLength };
+      });
+
+      await expect(
+        applyChanges(
+          db,
+          [
+            {
+              kind: "file",
+              rev: 1,
+              path: "/ragged.txt",
+              mode: 0o644,
+              mtime: 1000,
+              size: first.byteLength + second.byteLength,
+              chunks,
+            },
+          ],
+          new Map(),
+          { source: "upstream" },
+        ),
+      ).rejects.toThrow(/chunk/);
+      expect(resolveInode(db, "/ragged.txt")).toBeNull();
+    });
+  });
+
+  it("leaves the existing file in place when it rejects a ragged entry", async () => {
+    await withDB(async (db) => {
+      await writeFile(db, "/keep.txt", "original", {}, () => 1000);
+
+      const first = new TextEncoder().encode("first");
+      const second = new TextEncoder().encode("second");
+      const chunks = [first, second].map((bytes) => {
+        const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+        stageBlob(db, hash, bytes, 1000);
+        return { hash, size: bytes.byteLength };
+      });
+
+      await expect(
+        applyChanges(
+          db,
+          [
+            {
+              kind: "file",
+              rev: 2,
+              path: "/keep.txt",
+              mode: 0o644,
+              mtime: 2000,
+              size: first.byteLength + second.byteLength,
+              chunks,
+            },
+          ],
+          new Map(),
+          { source: "upstream" },
+        ),
+      ).rejects.toThrow(/chunk/);
+      expect(await readFile(db, "/keep.txt", "utf8")).toBe("original");
+    });
+  });
+
+  it("rejects a file entry with a chunk larger than the chunk size", async () => {
+    await withDB(async (db) => {
+      const bytes = new Uint8Array(CHUNK_SIZE + 1);
+      const hash = new Uint8Array(createHash("sha256").update(bytes).digest());
+      stageBlob(db, hash, bytes, 1000);
+
+      await expect(
+        applyChanges(
+          db,
+          [
+            {
+              kind: "file",
+              rev: 1,
+              path: "/oversized.bin",
+              mode: 0o644,
+              mtime: 1000,
+              size: bytes.byteLength,
+              chunks: [{ hash, size: bytes.byteLength }],
+            },
+          ],
+          new Map(),
+          { source: "upstream" },
+        ),
+      ).rejects.toThrow(/chunk/);
+      expect(resolveInode(db, "/oversized.bin")).toBeNull();
+    });
   });
 
   it("commits in batches capped by byte budget", async () => {

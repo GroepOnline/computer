@@ -20,7 +20,7 @@ builds the binary, stages it into `bin/computerd`, and publishes the image
 instead:
 
 ```dockerfile
-FROM ghcr.io/cloudflare/computer-computerd-linux-x64:0.1.0-alpha.1 AS computerd
+FROM ghcr.io/cloudflare/computer-computerd-linux-x64:0.4.1 AS computerd
 FROM debian:stable-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -35,7 +35,10 @@ ENTRYPOINT ["/usr/local/bin/computerd"]
 ```
 
 Pin the image version explicitly. `latest` is fine for experimentation but
-can bite when wire-protocol changes land.
+can bite when wire-protocol changes land. The `Next computerd image` workflow
+publishes `ghcr.io/cloudflare/computer-computerd-linux-x64:next` after
+successful CI on the `release` branch. Use this mutable tag only for tests and
+examples that intentionally track release candidates.
 
 ## Configuration
 
@@ -46,4 +49,3 @@ can bite when wire-protocol changes land.
 | `PORT` | `8080` | HTTP + WebSocket listener port. |
 | `MOUNT_POINT` | `/workspace` | Path the FUSE filesystem mounts at. |
 | `FUSE_MOUNT` | `auto` | Backend selector. `auto` probes `/dev/fuse` (linux) or macFUSE (darwin) and falls back to the userspace shim. `fuse` and `macfuse` require their respective real backend. `shim` forces the userspace shim. `none` skips the mount entirely; HTTP / WS still come up. |
-| `UPSTREAM_URL` | unset | If set, computerd dials this WebSocket on boot and runs a bidirectional sync loop against it. |

@@ -24,20 +24,20 @@ capnweb WebSocket session.
 │  │ Workspace           │  │                  │  │ computerd              │  │
 │  │  fs:  WorkspaceFS   │  │                  │  │  HTTP server     │  │
 │  │  shell: ShellRPC    │  │                  │  │   /health        │  │
-│  │  sync: SyncRPC      │◀─┼── capnweb WS ───▶│  │   /connect /ws   │  │
+│  │  sync: SyncRPC      │◀─┼── capnweb WS ───▶│  │  /connect /api   │  │
 │  │  push() / pull()    │  │                  │  │  FUSE mount      │  │
 │  │  ready()            │  │                  │  │  exec runner     │  │
 │  └──────────┬──────────┘  │                  │  └────────┬─────────┘  │
 │             │             │                  │           │            │
 │  ┌──────────▼──────────┐  │                  │  ┌────────▼─────────┐  │
-│  │ SQLite (ctx.storage)│  │                  │  │ In-memory VFS    │  │
-│  │  _vfs_watermark     │  │                  │  │  (process-       │  │
-│  │  vfs_blobs / nodes  │  │                  │  │   lifetime DB)   │  │
+│  │ SQLite (ctx.storage)│  │                  │  │ SQLite VFS       │  │
+│  │  _vfs_watermark     │  │                  │  │  (in memory, or  │  │
+│  │  vfs_blobs / nodes  │  │                  │  │   COMPUTERD_DB)  │  │
 │  └─────────────────────┘  │                  │  └──────────────────┘  │
 └───────────────────────────┘                  └────────────────────────┘
         |                                                  |
-        | source of truth                  process-lifetime |
-        | (durable across restarts)        (lost on restart)|
+        | source of truth                    mirror, in memory
+        | (durable across restarts)          or on the container disk
 ```
 
 The 1:1 mapping is load-bearing for several reasons:
@@ -50,7 +50,7 @@ The 1:1 mapping is load-bearing for several reasons:
   doesn't have to multiplex multiple WS peers.
 
 The DO is the WebSocket *server* in this pairing, even though `computerd`
-exposes its own `/ws` server-side and could be dialed directly. The
+exposes its own `/api` server-side and could be dialed directly. The
 reason for the inversion is documented in
 [07. Injected Service §Bootstrap sequence](./07_injected_service.md):
 the egress interceptor needs to be wired before any traffic flows, and
@@ -84,12 +84,15 @@ an incarnation boundary. What survives is:
   container-side cursor the DO has fetched). These are written via the
   same SQLite transaction as the data they describe, so they cannot
   drift out of sync with the store.
+- The latest container runtime UUID for each execution ID. This lets a
+  reconstructed Workspace reject stale get, kill, or dispose calls before
+  they can reach a replacement container that reused the same ID.
 
 On every new incarnation `Workspace.ready()` re-runs `#connect()`,
 which re-enters the backend's bootstrap sequence. If the container is
-still alive, the backend's `POST /connect` + `/ws` handshake produces
-a fresh capnweb session against the same in-memory VFS on the
-container side. If the container died too (e.g. host OOM took both),
+still alive, the backend's `POST /connect` + `/api` handshake produces
+a fresh capnweb session against the same container-side VFS. If the
+container died too,
 the next sync round is a rev-0 baseline rebuild from the DO's store.
 
 ### Wake triggers
@@ -122,13 +125,27 @@ lifetime policy. From the DO's perspective:
 `computerd` is a long-lived process. It outlives DO restarts — the
 `Container.monitor()` promise resolves only when the container itself
 exits, and the backend's `#monitoring` flag drops the cached handle at
-that point so the next call rebuilds from scratch (see the container host and backend implementations under `packages/computer/src/backends/container/`).
+that point so the next call rebuilds from scratch. The primary implementation
+lives under `packages/computer/src/backends/container/`; the
+platform-scheduled variant lives under
+`packages/computer/src/backends/container-legacy/`.
 
-The critical asymmetry: the **container's VFS is process-lifetime
-in-memory**, while the **DO's VFS is durable SQLite**. A container
-restart loses container-side state. Sync via `UPSTREAM_URL` (which
-the Cloudflare backend wires automatically) is what brings state back
-on the next push/pull round.
+When `computerd` runs with its default in-memory store, the two sides
+differ: the **container's VFS lasts only as long as the process**,
+while the **DO's VFS is durable SQLite**. A container restart loses
+container-side state. The durable object drives sync across the
+capnweb session it opens through `POST /connect`, and that is what
+brings state back on the next push/pull round.
+
+Setting `COMPUTERD_DB` to a path changes this for a process restart.
+The container-side store is written to disk, sync cursors included,
+and reopened on the next start. The durable object then finds a peer
+that still knows what it was sent, and only sends the difference.
+
+The container's disk does not survive a container restart, so this
+helps a `computerd` crash inside a live container today. It will help
+a container restart once the platform offers disk snapshots. See the
+`computerd` README for the setting and its limits.
 
 ## Capnweb lifecycle
 
@@ -154,11 +171,13 @@ the `close` callback, the session is gone.
 
 ### Where capnweb attaches in our code
 
-On the DO side: `newWebSocketRpcSession(ws)` in
-`CloudflareContainerBackend.connect()` in `packages/computer/src/backends/container/cloudflare-container.ts`.
-This installs `addEventListener("message", ...)` on the accepted
-WebSocket, which means **the DO must be alive in memory to receive
-frames**. There is no hibernation-aware variant today.
+On the durable object side, `ContainerBackend.connect()` calls
+`newWebSocketRpcSession(ws)` in
+`packages/computer/src/backends/container/container-backend.ts`.
+`LegacyContainerBackend` uses the same session setup. This installs
+`addEventListener("message", ...)` on the accepted WebSocket, which means
+**the durable object must be alive in memory to receive frames**. There is
+no hibernation-aware variant today.
 
 On the container side, `acceptWebSocketSession(ws, rpc)` is attached by the inbound upgrade and outbound `/connect` paths in `packages/computerd/src/cli/computerd.ts`. Both attach to a `ws`
 package WebSocket and require the `computerd` process to be live.
@@ -173,14 +192,11 @@ package WebSocket and require the `computerd` process to be live.
 3. **Death.** The WebSocket closes (clean or RST). capnweb errors
    every pending answer. The session is unrecoverable.
 
-The death case today is **not handled** — the `Workspace` keeps its
-`#handle` reference pointing at the dead session, and the next RPC
-call throws. The caller is expected to reconstruct the workspace.
+Session death is handled at the `Workspace` backend boundary. A close event, capnweb `onRpcBroken` callback, container exit, or classified transport error removes and closes the matching handle. The original operation gets one reconnect retry when replay is safe; the replacement handle is not exposed until computerd passes its health check and `reconcileWatermarks()` has compared the two stores.
 
 ### What an in-flight RPC looks like across a transport failure
 
-Because the rev counters drive every operation, a torn RPC is safe
-to retry against a fresh session. Specifically:
+Because the revision counters drive every sync operation, a torn sync RPC is safe to retry against a fresh session. `Workspace` performs one such reconnect retry automatically. Specifically:
 
 - **`pushOnce`.** `pushRev` is written only after
   `assertAppliedPushCursor` succeeds. A torn push leaves `pushRev` at
@@ -192,12 +208,11 @@ to retry against a fresh session. Specifically:
   past that point, including within the same rev. `applyChanges`'s
   `alreadyApplied` check drops any duplicates the resume happens to
   overlap with.
-- **`exec.events`.** Each event carries a monotonic `seq` per exec
-  id. The client reattaches via `getExec({ id, after: seq })`.
+- **`exec` dispatch.** A failed connection setup or a local disposed-stub error happens before dispatch and can be retried once. Other transport failures are ambiguous: computerd may have accepted the command before the response was lost. The backend invalidates the handle and reports the failure without replaying the command.
+- **`exec.events`.** Each event carries a monotonic `seq` per exec ID and callers can reattach with `getExec({ id, after: seq })`. The current automatic recovery boundary does not reattach a torn event stream; it reports the stream failure and leaves the next explicit operation to reconnect.
+- **`getExec`, `killExec`, and `disposeExec`.** These ID-addressed operations get one reconnect retry when the connection still points at the same container runtime UUID. A replacement process has an empty execution registry, so a runtime mismatch returns `EEXEC_LOST` without sending the old execution ID to the replacement.
 
-This is why the sync protocol survives transport failures: every
-operation has a persistent cursor, and every receiver is idempotent.
-capnweb itself is fragile, but the protocol layered on top isn't.
+This is why the sync protocol survives transport failures: every sync operation has a persistent cursor, and every receiver is idempotent. Shell commands require the separate no-replay boundary above because their side effects are not generally idempotent. capnweb itself is fragile, but the protocols layered on top define where recovery is safe.
 
 ### Stub disposal contract
 
@@ -283,11 +298,10 @@ prove no unbounded growth under sustained workloads.
 
 > [!NOTE]
 > This section describes a target architecture, not shipped code.
-> Today's `CloudflareContainerBackend` uses `server.accept()`, which
-> is **not** the hibernation API. The DO stays in memory for the
-> lifetime of the WebSocket. Enabling hibernation requires changes
-> across capnweb and the backend; the work is sketched here so the
-> direction is clear.
+> Today's container backends use `server.accept()`, which is **not** the
+> hibernation API. The durable object stays in memory for the lifetime of
+> the WebSocket. Enabling hibernation requires changes across capnweb and
+> both backends; the work is sketched here so the direction is clear.
 
 ### What hibernation gives us
 
@@ -374,7 +388,7 @@ between agent turns, and it's exactly where hibernation pays off.
 
 Adopting PartySocket for reconnect/backoff would require the DO
 to be the WebSocket *client* dialing `computerd`'s
-`/ws` endpoint. That model is appealing for reconnect, but
+`/api` endpoint. That model is appealing for reconnect, but
 hibernatable WebSockets only work server-side via
 `ctx.acceptWebSocket()` — there is no hibernation API for outbound
 client sockets. **Inverting the dial direction permanently forecloses
@@ -394,9 +408,9 @@ items not yet shipped.
 | DO restart, container alive | New incarnation | Unchanged | Fresh session over fresh socket |
 | DO hibernate (future) | Isolate evicted, socket survives | Unchanged | *Fresh tables on wake; sync resumes from `_vfs_watermark`, exec resumes from `serializeAttachment` seqs* |
 | DO OOM | Killed, new incarnation on next event | Unchanged (until backend rebuilds) | Dies, fresh session on next call |
-| Container SIGTERM | Unchanged until next call | Restarted; in-memory VFS lost | Dies on container exit; *watermark reconcile on next connect repairs the mismatch* |
-| Container OOM/kill | Unchanged until next call | Killed; restarted on next call | Same as SIGTERM |
-| WebSocket idle disconnect | Unchanged | Unchanged | Dies on `close`; *reconnect wrapper rebuilds* |
+| Container SIGTERM | Invalidates the handle and reconnects on the active or next operation | Restarted; in-memory VFS lost | Dies on container exit; watermark reconciliation rebuilds from Durable Object storage |
+| Container OOM/kill | Invalidates the handle and reconnects on the active or next operation | Killed; restarted on reconnect | Same as SIGTERM; container-only unsynced data is lost |
+| WebSocket idle disconnect | Invalidates and closes the handle | Unchanged | Dies on `close`; replay-safe operations reconnect once |
 | Both die (host failure) | New incarnation on next event | New container | Rev-0 baseline from DO store |
 
 The recurring theme: **DO storage is the only durable thing in this

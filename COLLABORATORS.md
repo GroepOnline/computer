@@ -11,7 +11,7 @@ Requirements:
 - Node 22 or newer. `packages/computerd` declares `"engines": { "node": ">=22" }`.
 - npm. This repo uses npm workspaces, not pnpm or yarn.
 - Linux with FUSE if you want to run `packages/computerd` end-to-end. The rest of the workspace builds and tests on macOS as well.
-- Docker, optionally, for `examples/container`.
+- Docker, optionally, for `examples/container-legacy`.
 
 Clone and install from the repo root:
 
@@ -84,10 +84,13 @@ New behavior needs a test. Bug fixes need a reproduction test that failed before
 ```bash
 npm run typecheck     # tsc --noEmit across workspaces
 npm run build         # library builds
+npm run build:types   # per-example worker-configuration.d.ts
 npm run build:all     # libraries, bundled binaries, docker images
 ```
 
 `build:all` is the union of `build`, `build:bin`, and `build:docker`. Only run it if you need the binary or Docker artifacts. It is slow.
+
+Every example's Worker binding types are generated, not committed. Each example owns a `build:types` script that runs `wrangler types` against its `wrangler.jsonc` and, where the example documents secrets, its committed env template. The repo-root `postinstall` hook runs all of them, so `npm install` leaves a `worker-configuration.d.ts` in every example. Rerun `npm run build:types` after changing a `wrangler.jsonc` or an env template; the example's typecheck fails against a stale file.
 
 ## Commit messages
 
@@ -144,11 +147,17 @@ Once your pull request merges to `main`, the release workflow takes
 over in two steps:
 
 1. It gathers the pending changesets into a "Version Packages" pull
-   request that bumps package versions, rewrites changelogs, and updates
-   Dockerfile and documentation pins for the `computerd` image. Private
-   packages such as `@cloudflare/dofs`, `@cloudflare/computer-rpc`, and
-   `@cloudflare/computerd` are versioned and get changelogs, but are not
-   published to npm.
+   request from the `release` branch. That pull request advances
+   `@cloudflare/computer`, its private implementation packages, and the
+   derivative image package to the same version, rewrites changelogs, and
+   updates Dockerfile and documentation pins for the `computerd` image.
+   Private packages such as `@cloudflare/dofs`,
+   `@cloudflare/computer-rpc`, and `@cloudflare/computerd` are versioned and
+   get changelogs, but are not published to npm. Each update publishes a
+   package preview through
+   `pkg.pr.new` and the mutable
+   `ghcr.io/cloudflare/computer-computerd-linux-x64:next` image after CI
+   passes.
 2. Merging that pull request first builds and pushes the `computerd`
    binary image to `ghcr.io` and `registry.cloudflare.com`, then publishes
    public npm packages. Rerunning a failed publish is safe: existing image
@@ -169,4 +178,4 @@ For a prerelease channel (`alpha`, `beta`, `rc`), a maintainer runs
 - `node_modules/`, `dist/`, `artifacts/`. These are already ignored, but double-check `git status` before staging.
 - `.env` and `.dev.vars`. Local secrets and per-developer settings stay on your machine.
 - Editor or operating system scratch files. Add them to your global gitignore rather than to this repo's `.gitignore`.
-- Generated `worker-configuration.d.ts` files, except for the copies checked in under `examples/`.
+- Generated `worker-configuration.d.ts` files. Every copy is produced by an example's `build:types` script and ignored.

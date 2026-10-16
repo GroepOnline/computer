@@ -16,17 +16,29 @@ container, not on `WorkspaceOptions`).
 
 ```ts
 import { Workspace } from "@cloudflare/computer";
-import { CloudflareContainerBackend } from "@cloudflare/computer/backends/container";
+import {
+  ContainerBackend,
+  withWorkspaceContainer,
+} from "@cloudflare/computer/backends/container";
+import { DurableObject } from "cloudflare:workers";
 
-new Workspace({
-  storage:  ctx.storage,
-  backends: [
-    new CloudflareContainerBackend({
-      container: () => this,
-      workspace: { binding: "ContainerExample", id: ctx.id.toString() },
-    }),
-  ],
-});
+class WorkspaceHost extends withWorkspaceContainer(class extends DurableObject<Env> {}) {
+  readonly backend = new ContainerBackend({
+    container: () => this,
+    workspace: { binding: "WorkspaceHost", id: this.ctx.id.toString() },
+    name: "app",
+    instance: "standard-2",
+  });
+
+  readonly workspace = new Workspace({
+    storage: this.ctx.storage,
+    backends: [this.backend],
+  });
+
+  override fetch(request: Request): Promise<Response> {
+    return this.backend.handleFetch(request);
+  }
+}
 ```
 
 `backends` is optional. Omit it to construct a filesystem-only
@@ -36,7 +48,7 @@ Workspace where `fs` works against the local SQLite store but
 `WorkspaceOptions` includes the storage handle, optional backends,
 clock, session id, mounts, observer, git identity, assets, artifacts,
 and `useThink`. There is no `root` or `sandbox` field on the host
-facade — sandbox wiring lives behind a `WorkspaceBackend`.
+wrapper — sandbox wiring lives behind a `WorkspaceBackend`.
 
 Set `useThink: true` when assigning the Workspace to
 `Think.workspace`. This adds Think's string-oriented filesystem
@@ -126,7 +138,7 @@ by the in-image `FUSE_MOUNT` env var (`auto` by default; see doc 07).
 On Cloudflare Containers `/dev/fuse` is exposed and the real kernel
 FUSE backend mounts; under `wrangler dev` it isn't, and `auto` falls
 back to the userspace shim. Either way the in-container view is a
-live mirror of the DO-side VFS. Earlier revisions of `CloudflareContainerBackend`
+live mirror of the DO-side VFS. Earlier revisions of the container backend
 pinned `DISABLE_FUSE=1`, which produced a degraded mode where:
 
 - The in-container filesystem at `/workspace` is the container's own

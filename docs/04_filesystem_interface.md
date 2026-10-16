@@ -37,18 +37,39 @@ method-by-method mapping against `node:fs/promises`.
 ### `readFile`
 
 ```ts
+type ReadFileRange = {
+  byteOffset?: number; // default 0
+  byteLength?: number; // default: remainder of the file
+};
+
 readFile(path: string): Promise<ReadableStream<Uint8Array>>
 readFile(path: string, encoding: "utf8"): Promise<string>
-readFile(path: string, options: { encoding?: "utf8" }): Promise<string>
+readFile(path: string, options: ReadFileRange): Promise<ReadableStream<Uint8Array>>
+readFile(
+  path: string,
+  options: ReadFileRange & { encoding: "utf8" },
+): Promise<string>
 ```
 
 Defaulting to a stream is deliberate — most reads in an agent context
-are "send this file somewhere" and never need to be in memory.
+are "send this file somewhere" and never need to be in memory. A ranged
+stream resolves the file and captures its overlapping chunk rows once,
+then lazily sends those content-addressed blobs. This preserves the existing
+whole-file stream behavior across ordinary concurrent writes while avoiding
+reads before `byteOffset`. The same single stream
+crosses the Workers RPC boundary; callers do not issue one RPC invocation
+per storage chunk.
 
 ```ts
 // Stream a large file straight to the client.
 const stream = await fs.readFile("/workspace/build/out.wasm");
 return new Response(stream, { headers: { "content-type": "application/wasm" } });
+
+// Resume a stream at a byte continuation and cap the transfer.
+const continuation = await fs.readFile("/workspace/build/out.wasm", {
+  byteOffset: 1_048_576,
+  byteLength: 262_144,
+});
 
 // Read a small text file into a string.
 const todo = await fs.readFile("/workspace/notes/todo.md", "utf8");
@@ -169,8 +190,10 @@ stat(path: string): Promise<{
 `name` is the last segment of the canonicalized path. For the workspace
 root this is the empty string: `(await fs.stat("/")).name === ""`.
 
-`stat` follows symlinks transparently; there is no `lstat`. See the
-note on internal symlink support in the appendix.
+`stat` follows a trailing symbolic link, so it reports the file or
+directory the link points at. Use [`lstat`](#lstat) to inspect the link
+itself. A dangling link makes `stat` report `ENOENT` while `lstat`
+succeeds.
 
 > When a parent path segment is itself a file, `stat` reports `ENOENT`
 > (because resolution returns `null` for that case) rather than
@@ -182,12 +205,128 @@ const s = await fs.stat("/workspace/build/out.wasm");
 console.log(`${s.size} bytes, modified ${new Date(s.mtime).toISOString()}`);
 ```
 
+### `lstat`
+
+```ts
+lstat(path: string): Promise<{
+  name:            string;
+  mode:            number;
+  mtime:           number;   // ms since epoch
+  size:            number;
+  isFile:          boolean;
+  isDirectory:     boolean;
+  isSymbolicLink:  boolean;
+}>
+```
+
+Same shape as `stat`, but a trailing symbolic link is reported as the
+link rather than followed. `size` is then the byte length of the stored
+target string, and `isSymbolicLink` is true. Intermediate segments are
+still followed, so a link in the middle of the path resolves as usual.
+Throws `ENOENT` when the path does not exist and `ELOOP` when an
+intermediate chain exceeds 40 hops.
+
+```ts
+await fs.symlink("/workspace/real.txt", "/workspace/alias.txt");
+(await fs.stat("/workspace/alias.txt")).isSymbolicLink;   // false
+(await fs.lstat("/workspace/alias.txt")).isSymbolicLink;  // true
+```
+
+### `symlink`
+
+```ts
+symlink(target: string, path: string): Promise<void>
+```
+
+Creates a symbolic link at `path` pointing at `target`, with the
+argument order of `node:fs/promises`. The target is stored verbatim: it
+may be absolute or relative, and it is allowed to dangle. Reads and
+writes that walk through the link follow it, with the same 40-hop cap as
+every other resolution.
+
+Throws `EEXIST` when `path` already exists (the link is never replaced
+silently), `ENOENT` when the parent directory is missing, `ENOTDIR` when
+a parent segment is a file, and `EROFS` under a read-only mount.
+
+```ts
+await fs.symlink("../shared/config.json", "/workspace/app/config.json");
+```
+
+### `readlink`
+
+```ts
+readlink(path: string): Promise<string>
+```
+
+Returns the stored target of a symbolic link, exactly as it was
+written — relative targets are not resolved. Throws `EINVAL` when `path`
+is not a symbolic link and `ENOENT` when it does not exist.
+
+```ts
+await fs.readlink("/workspace/app/config.json"); // "../shared/config.json"
+```
+
+### `chmod`
+
+```ts
+chmod(path: string, mode: number): Promise<void>
+```
+
+Changes the permission bits of an existing path without rewriting its
+bytes. The mode is masked to twelve bits. Like POSIX `chmod`, a trailing
+symbolic link is followed, so the change lands on the target rather than
+the link. Throws `ENOENT` for a missing path and `EROFS` under a
+read-only mount.
+
+```ts
+await fs.chmod("/workspace/bin/run.sh", 0o755);
+```
+
+### `rename`
+
+```ts
+rename(oldPath: string, newPath: string): Promise<void>
+```
+
+Moves a file, directory, or symbolic link in a single transaction, so an
+interrupted call can never leave the entry at both paths or a directory
+partly copied. The moved entry keeps its inode, its bytes, and its mode;
+a directory move carries its whole subtree.
+
+Overwrite behavior follows POSIX `rename(2)`: an existing destination is
+replaced when the two ends agree on kind. A file or symbolic link
+replaces a file or symbolic link, and a directory replaces an *empty*
+directory. Nothing else is replaced.
+
+| Code | When |
+| --- | --- |
+| `ENOENT` | `oldPath` does not exist, or `newPath`'s parent directory is missing. |
+| `ENOTEMPTY` | `newPath` is a directory with children. |
+| `EISDIR` | `newPath` is a directory and `oldPath` is not. |
+| `ENOTDIR` | `oldPath` is a directory and `newPath` is not. |
+| `EINVAL` | Either end is the root, or a directory would be moved inside itself. |
+| `EROFS` | Either end falls under a read-only mount. |
+
+```ts
+// Publish a build atomically.
+await fs.writeFile("/workspace/site/index.html.tmp", html);
+await fs.rename("/workspace/site/index.html.tmp", "/workspace/site/index.html");
+
+// Move a whole tree.
+await fs.rename("/workspace/draft", "/workspace/published");
+```
+
 ### `find`
 
 ```ts
 find(
   directory: string,
-  pattern?:  string,           // simple glob (`*.ts`, `**/*.md`)
+  pattern?: string,            // simple glob (`*.ts`, `**/*.md`)
+  options?: {
+    limit?: number;
+    offset?: number;
+    exclude?: string[];
+  },
 ): Promise<Array<{ path; type: "file" | "dir" }>>
 ```
 
@@ -197,8 +336,15 @@ matched against each candidate's path **relative to `directory`**, not
 its absolute path — so `**/*.ts` under `/workspace/src` matches
 `a/b.ts`, not `/workspace/src/a/b.ts`.
 
-Only `*`, `**`, and `**/` are honored; `?`, character classes, and
+The glob supports `*`, `**`, `**/`, and `?`. Character classes and
 brace expansions are matched literally.
+
+`exclude` takes globs of the same shape, matched against the same
+relative path. An exclusion is decided before the inclusion glob, so it
+always wins. When an excluded entry is a directory the walk prunes it:
+neither the directory nor anything beneath it is read, which is what
+makes skipping `node_modules` or `.git` cheap rather than merely quiet.
+`limit` and `offset` then paginate whatever survives.
 
 ```ts
 // Every TypeScript file in the project.
@@ -206,6 +352,11 @@ const ts = await fs.find("/workspace/src", "**/*.ts");
 
 // Everything under a directory (no pattern).
 const all = await fs.find("/workspace/notes");
+
+// Skip generated trees without descending into them.
+const sources = await fs.find("/workspace", "**/*.ts", {
+  exclude: ["node_modules", "node_modules/**", ".git", ".git/**"],
+});
 ```
 
 ### `ls`
@@ -231,38 +382,71 @@ const paths = await fs.ls("/workspace/.agents/skills");
 
 ### `grep`
 
-Available on `Workspace.fs` for parity with the agent tools, and on
-`Workspace.runtime` when you want it to run inside the container (faster
-for large trees because it uses ripgrep).
+`Workspace.fs.grep` accepts this interface:
 
 ```ts
+interface GrepOptions {
+  regex?: boolean;
+  ignoreCase?: boolean;
+  context?: number;
+  limit?: number;
+  offset?: number;
+  include?: string;
+  exclude?: string[];
+}
+
+interface WorkspaceGrepContextLine {
+  line: number;
+  text: string;
+  isMatch: boolean;
+}
+
+interface WorkspaceGrepMatch {
+  path: string;
+  line: number;
+  text: string;
+  context?: WorkspaceGrepContextLine[];
+}
+
 grep(
   pattern: string,
-  path:    string,
-  options?: { ignoreCase?: boolean }
-): Promise<{ path: string; line: number; text: string }[]>
+  path: string,
+  options?: GrepOptions,
+): Promise<WorkspaceGrepMatch[]>
 ```
 
-`pattern` is a **literal substring** — not a regex, not a glob.
-`ignoreCase` lowercases both sides before comparing.
+Matching is literal and case-sensitive by default. Set `regex: true` to
+interpret `pattern` as a regular expression and `ignoreCase: true` to ignore
+letter case. `context` adds that many lines before and after each match.
+`include` is a glob relative to a searched directory. `limit` and `offset`
+paginate matching lines.
 
-`path` may be a directory **or a single file**. Directory walks return
-matches in walk order. Each result row carries:
+`exclude` takes globs of the same shape as `find`'s, matched against the same
+directory-relative path and applied before `include`, so an exclusion always
+wins. An excluded directory is pruned before its children are queried, so the
+subtree costs nothing rather than being read and filtered. As with `find`, name
+both the directory and its contents to skip a whole subtree: `node_modules/**`
+matches what is below `node_modules`, not `node_modules` itself.
 
-- `path` — absolute path of the matching file.
-- `line` — 1-indexed line number within that file.
-- `text` — the entire matching line (without the trailing newline), not
-  just the matched substring.
+`path` may be a directory or a single file. Directory searches return matches
+in deterministic depth-first discovery order, then line order within each
+file. Results are not globally sorted by full path. A single-file search has no
+traversal to prune, so `exclude` does not apply to it.
 
 ```ts
-const hits = await fs.grep("TODO", "/workspace/src", { ignoreCase: true });
+const hits = await fs.grep("TODO", "/workspace/src", {
+  ignoreCase: true,
+  include: "**/*.ts",
+  exclude: ["node_modules", "node_modules/**"],
+});
 for (const hit of hits) {
   console.log(`${hit.path}:${hit.line}: ${hit.text}`);
 }
 ```
 
-See [05. Shell Interface](./05_runtime_interface.md) for the container-side
-variant.
+`Workspace.runtime` exposes a narrower container-side variant that accepts only
+`ignoreCase` and treats its pattern as a literal string. See
+[05. Shell Interface](./05_runtime_interface.md) for that variant.
 
 ## Error handling
 
@@ -273,12 +457,12 @@ so handlers from Node code port over directly.
 | Code | When |
 | --- | --- |
 | `ENOENT` | Path does not exist and `force` is not true. Also raised by `stat` when a parent segment turns out to be a file. |
-| `ENOTEMPTY` | Path is a non-empty directory and `recursive` is not true. |
-| `ENOTDIR` | A parent path segment is a file (raised explicitly by `mkdir` and `writeFile`; `find` raises it when its `directory` argument is a file). |
-| `EISDIR` | Expected a file, got a directory (e.g. `readFile` on a dir, `writeFile` on `/`). |
-| `EEXIST` | `mkdir` without `recursive: true` on an existing path. |
-| `EINVAL` | Invalid path or unsupported options. |
-| `ELOOP` | Symlink traversal exceeded 40 hops. Thrown by the internal resolver when the `node:vfs` adapter wires up a cycle. |
+| `ENOTEMPTY` | Path is a non-empty directory and `recursive` is not true. Also raised by `rename` when the destination directory has children. |
+| `ENOTDIR` | A parent path segment is a file (raised explicitly by `mkdir` and `writeFile`; `find` raises it when its `directory` argument is a file; `rename` raises it when a directory would replace a non-directory). |
+| `EISDIR` | Expected a file, got a directory (e.g. `readFile` on a dir, `writeFile` on `/`, `rename` of a file onto a directory). |
+| `EEXIST` | `mkdir` without `recursive: true` on an existing path, or `symlink` onto an existing path. |
+| `EINVAL` | Invalid path or unsupported options: `readlink` on something that is not a symbolic link, `rename` of the root or of a directory into itself. |
+| `ELOOP` | Symbolic-link traversal exceeded 40 hops. Every path-walking method shares that budget, so a cycle surfaces from `stat`, `readFile`, `writeFile`, `mkdir`, and the rest alike. |
 | `EPERM` | Operation is forbidden, e.g. deleting the workspace root. |
 | `EIO` | Backing storage failed unexpectedly. |
 | `EACCES` | *Reserved for future mount layer (see [06. Mount Interface](./06_mount_interface.md)).* No code path in `workspace-fs` currently throws it. |
@@ -331,28 +515,35 @@ maps to `Workspace.fs`:
 | `rm` | `rm` | `{ recursive: true }` for non-empty dirs. |
 | `unlink` | `rm` | Same. |
 | `readdir` | `readdir` | Always returns dirent-shaped entries. |
-| `stat` / `lstat` | `stat` | No `lstat`; `stat` follows symlinks. See note below. |
+| `stat` / `lstat` | `stat` / `lstat` | `stat` follows a trailing symbolic link; `lstat` reports the link. |
 | `truncate` | — | Read, slice, write. |
-| `chmod` | — | Pass `mode` to `writeFile` / `mkdir` at create time. There is no way to chmod an existing file without rewriting its bytes. |
+| `chmod` | `chmod` | Mode masked to twelve bits; follows a trailing symbolic link. `mode` can also be passed to `writeFile` / `mkdir` at create time. |
 | `chown` | — | No ownership model. |
 | `utimes` | — | `mtime` is managed by the VFS. |
 | `cp` / `copyFile` | — | Read + write. |
-| `rename` | — | Read + write + delete. |
+| `rename` | `rename` | One transaction; replaces a destination of the same kind. |
 | `realpath` | — | Paths are already canonical. |
-| `symlink` / `readlink` | — | Not on the public surface; see note below. |
+| `symlink` / `readlink` | `symlink` / `readlink` | Same argument order as Node. Targets are stored verbatim and may dangle. |
 | `watch` | — | Low-level primitive in `fs/watch.ts` (`createWatcher`, `createWatchAsyncIterable`, `WatchHandle`, `WatchOptions`); not exposed on the `WorkspaceFilesystem` class. |
 | `open` / `FileHandle` | — | Use streams instead. |
-| `glob` | `find` | Limited glob support (`*`, `**`, `**/` only). |
-| — | `grep` | Not in `node:fs`; included here for agents. Substring match. |
+| `glob` | `find` | Limited glob support (`*`, `**`, `**/`, and `?`), plus `exclude` for pruning subtrees. |
+| — | `grep` | Not in `node:fs`; literal by default, with optional regular expressions. Shares `find`'s `include`/`exclude` globs. |
 | — | `find` | Recursive directory walk with an optional glob, relative-rooted. |
 | — | `ls` | Flat list of file paths under a directory (segment-aware). |
 
-### Note: symlinks
+### Note: symbolic links
 
-Symlinks exist as an **internal primitive** used by the `node:vfs`
-adapter — the schema supports a `'symlink'` node type with a
-`link_target`, and the resolver in `fs/resolve.ts` follows them with a
-40-hop cap (throws `ELOOP` on overflow). They are **not** part of the
-public `WorkspaceFilesystem` surface: there are no `fs.symlink` or
-`fs.readlink` methods on `Workspace.fs`, and callers should treat all
-visible paths as if they pointed straight at real files.
+Symbolic links are part of the public surface. The schema carries a
+`'symlink'` node type with a `link_target`, the resolver in
+`fs/resolve.ts` follows them with a 40-hop cap (throws `ELOOP` on
+overflow), and `Workspace.fs` exposes `symlink`, `readlink`, and
+`lstat` on top of that. `WorkspaceFilesystemStub` mirrors all three
+across the Workers RPC boundary, which is how the Dynamic Worker
+filesystem adapters provide the `node:fs` behavior a shell expects from
+`ln -s`, `readlink`, and `test -L`.
+
+Two rules cover the whole surface. Intermediate segments are always
+followed, so a link to a directory behaves like the directory for every
+method, `mkdir` included. A trailing link is followed by everything
+except `lstat` and `readlink`, which are the two methods whose purpose
+is to describe the link itself.

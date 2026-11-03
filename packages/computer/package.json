@@ -82,7 +82,7 @@
   "peerDependencies": {
     "@platformatic/vfs": "*",
     "ai": "^6.0.196 || ^7.0.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.6"
   },
   "peerDependenciesMeta": {
     "@platformatic/vfs": {
@@ -111,6 +111,6 @@
     "typescript": "^6.0.3",
     "vitest": "^4.1.11",
     "wrangler": "^4.140.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.6"
   }
 }

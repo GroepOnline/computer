@@ -66,7 +66,8 @@ export class TanStackAgent extends DurableObject<Env> {
       agentLoopStrategy: maxIterations(10),
     });
 
-    return await streamToText(stream);
+    const { text } = await streamToText(stream);
+    return text;
   }
 }
 

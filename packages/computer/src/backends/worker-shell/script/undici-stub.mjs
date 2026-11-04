@@ -24,6 +24,13 @@ export class Agent {
   }
 }
 
+export class Headers {
+  constructor() {
+    excluded();
+  }
+}
+
+export const buildConnector = excluded;
 export const fetch = excluded;
 
-export default { Agent, fetch };
+export default { Agent, Headers, buildConnector, fetch };

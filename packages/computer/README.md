@@ -22,8 +22,9 @@ things in it.
   module. Pick a full Linux container, a fast in-Worker shell, or an
   isolated JavaScript runtime, all against the same files.
 - **Batteries for agents.** Ready-made [AI SDK](https://github.com/vercel/ai)
-  tools (`read`, `write`, `edit`, `ls`, `exec`), a git client, R2-backed
-  read-only mounts, and helpers for publishing files.
+  tools (`read`, `ls`, `find`, `grep`, `write`, `edit`, `delete`, and optional
+  `exec`), a git client, R2-backed read-only mounts, and helpers for publishing
+  files.
 
 The Workspace can also run with no execution backend at all, giving you
 just the filesystem.
@@ -49,8 +50,11 @@ worker-shell and worker-javascript backends additionally need the
 own binding requirements — see [Choosing a backend](#choosing-a-backend).
 
 Optional peer dependencies, installed only if you use the matching
-feature: `ai` and `zod` (for `@cloudflare/computer/tools`),
-`@platformatic/vfs` (for the Node-side VFS provider).
+feature: `zod` for every tools entry point, `ai` for
+`@cloudflare/computer/tools`, and
+`@platformatic/vfs` for the Node-side VFS provider. The pi and TanStack
+AI entry points need nothing beyond `zod`; your agent brings its own
+library.
 
 ## Quick start
 
@@ -100,6 +104,7 @@ quickest way to get `exec` working:
 ```ts
 import { withWorkspace, getWorkspace } from "@cloudflare/computer";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
+import curlModules from "@cloudflare/computer/shell/curl";
 import { DurableObject } from "cloudflare:workers";
 
 export class Agent extends withWorkspace(
@@ -111,6 +116,7 @@ export class Agent extends withWorkspace(
         loader: self.env.LOADER,
         workspace: { binding: "Agent", id: self.ctx.id.toString() },
         ctx: self.ctx,
+        commands: [curlModules],
       }),
     ],
   }),
@@ -125,6 +131,16 @@ Add the loader binding and the `experimental` flag to `wrangler.jsonc`:
   "worker_loaders": [{ "binding": "LOADER" }]
 }
 ```
+
+The worker shell ships as feature groups: an always-on core plus
+one optional group per command at
+`@cloudflare/computer/shell/<feature>`. Import the groups you want
+and pass them to `WorkerShellBackend`'s `commands` option; a group you
+never import is unreachable in your bundle and the bundler drops
+it. The optional groups are `curl`, `html-to-markdown`, `python`,
+`sqlite`, `js-exec`, `yq`, `file`, `xan`, and `jq`. `curl` runs on
+the isolate's global `fetch` (no `undici` in the bundle); egress
+stays governed by the Dynamic Worker's `globalOutbound`.
 
 Now `exec` runs against the same files your `fs` calls wrote:
 
@@ -225,7 +241,8 @@ Alongside `exec`, the runtime exposes `getExec`, `killExec`, and
 
 | Backend | Import | Runs | Needs |
 | --- | --- | --- | --- |
-| **Container** | `@cloudflare/computer/backends/container` | Shell commands in full Linux userland (real binaries, `npm`, `node`, network) | A Cloudflare Container running `computerd` |
+| **Container** | `@cloudflare/computer/backends/container` | Shell commands in full Linux userland (real binaries, `npm`, `node`, network) | A Cloudflare Container running `computerd`, scheduled by the durable object (`scheduling_policy: "durable_object"`) |
+| **Container (legacy)** | `@cloudflare/computer/backends/container-legacy` | The same | A Cloudflare Container the platform schedules and sizes from the `containers` block |
 | **Worker shell** | `@cloudflare/computer/backends/worker-shell` | Shell commands via [just-bash](https://github.com/vercel-labs/just-bash) in a Dynamic Worker | A Worker Loader binding; `experimental` flag |
 | **Worker JavaScript** | `@cloudflare/computer/backends/worker-javascript` | ECMAScript modules in a fresh Dynamic Worker | A Worker Loader binding; `experimental` flag |
 
@@ -233,7 +250,7 @@ Alongside `exec`, the runtime exposes `getExec`, `killExec`, and
   environment. The container owns its own SQLite-backed VFS and this
   package syncs the two stores across a capnweb WebSocket. See
   [`docs/07_injected_service.md`](../../docs/07_injected_service.md) for
-  the container image, and [`examples/container`](../../examples/container).
+  the container image, and [`examples/container-legacy`](../../examples/container-legacy).
 - **Worker shell** is fast and needs no container. Every filesystem
   operation forwards back to the same Durable Object, so there's no
   second store and no sync round trip. See
@@ -254,8 +271,10 @@ to a named one — see [Multiple backends](#multiple-backends).
 
 `@cloudflare/computer/tools` ships AI SDK tools that wrap the Workspace
 surfaces, ready to hand to `generateText`, `streamText`, or an agent
-framework's `getTools()`. The default set is `read`, `write`, `edit`,
-and `ls`; `exec` and `publish` are added when you configure them.
+framework's `getTools()`. The default set is `read`, `ls`, `find`,
+`grep`, `write`, `edit`, and `delete`; `exec` and `publish` are added
+when you configure them. Read-only mode keeps `read`, `ls`, `find`, and
+`grep`.
 
 ```ts
 import { createAITools } from "@cloudflare/computer/tools";
@@ -274,8 +293,33 @@ const tools = createAITools({
 ```
 
 The model reads each backend's `description` when deciding where a
-command should run, so write them in plain language. See
+command should run, so write them in plain language. Truncated text
+model output keeps both line and byte continuations; pass both to the
+next call to avoid transferring the same bytes again. Eligible image and
+PDF bytes are captured once during the bounded tool execution and returned
+as AI SDK `file` model output without re-reading the file. SVG source remains
+text. `ls`, `find`, and `grep` pass pagination through to the storage layer
+and return `nextOffset` when more results exist. `edit` falls back to
+Unicode- and whitespace-tolerant matching while splicing replacements into
+the original text, so untargeted content stays byte-for-byte unchanged. File
+mutations share locks across tool sets for the same workspace, and recursive
+deletion excludes mutations throughout its subtree. See
 [`docs/09_tool_interface.md`](../../docs/09_tool_interface.md).
+
+The same tools, with the same options, come for two more agent
+libraries. Each entry point loads only `zod` and its own code, so
+importing one never pulls in another library.
+
+```ts
+import { createPiTools } from "@cloudflare/computer/tools/pi-ai";
+import { createTanStackTools } from "@cloudflare/computer/tools/tanstack-ai";
+
+// pi: declarations for the model, and a function your loop calls per tool call.
+const { tools, execute } = createPiTools({ workspace });
+
+// TanStack AI: a list for chat({ tools }). This one asks before changing files.
+const tanstackTools = createTanStackTools({ workspace, approve: "mutating" });
+```
 
 ## Git
 
@@ -318,10 +362,12 @@ Two ways to get a file out of the workspace and into the world:
   `assets publish <path> [<expiry>]` command. See
   [`docs/14_assets_interface.md`](../../docs/14_assets_interface.md).
 - **Artifacts** (`@cloudflare/computer/artifacts`):
-  `createArtifact(binding, sessionId)` is a session-scoped facade over
+  `createArtifact(binding, sessionId)` is a wrapper over
   the [Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/)
   binding. Every repository name is implicitly prefixed with the session
-  id, so one namespace hosts many isolated sessions.
+  id, so one namespace hosts many isolated sessions. The session id is
+  optional: leave it off and the client spans the namespace, listing and
+  reaching every repository including those other sessions own.
 
 ```ts
 import { createArtifact } from "@cloudflare/computer/artifacts";
@@ -330,6 +376,9 @@ const artifacts = createArtifact(env.ARTIFACTS, agentId);
 const repo = await artifacts.create("build-cache", { description: "CI artifacts" });
 const token = await artifacts.createToken("build-cache", "read", 3600);
 const mine = await artifacts.list(); // only this session's repos
+
+const all = createArtifact(env.ARTIFACTS);
+await all.list(); // every repo in the namespace, under its stored name
 ```
 
 Artifacts also offers an argv CLI (`artifacts.cli({ argv })`), and when
@@ -384,14 +433,16 @@ on a computerd instance.
 
 | Entrypoint | Purpose |
 | --- | --- |
-| `@cloudflare/computer` | The `Workspace` facade, `workspace.runtime`, stub types, the R2 mount, and proxy classes. |
-| `@cloudflare/computer/backends/container` | `CloudflareContainerBackend` and `withWorkspaceContainer`. Pulls in the computerd / capnweb sync plumbing. |
+| `@cloudflare/computer` | The `Workspace` wrapper, `workspace.runtime`, stub types, the R2 mount, and proxy classes. |
+| `@cloudflare/computer/backends/container-legacy` | `LegacyContainerBackend` and `withLegacyWorkspaceContainer`. Pulls in the computerd / capnweb sync plumbing. |
 | `@cloudflare/computer/backends/worker-shell` | `WorkerShellBackend` and the bundled just-bash runtime. |
 | `@cloudflare/computer/backends/worker-javascript` | `WorkerJavaScriptBackend`, configured libraries, durable imports, `node:fs/promises`, and trusted `ws:git` / `ws:artifacts`. |
-| `@cloudflare/computer/tools` | AI SDK tools for agents: `read`, `write`, `edit`, `ls`, optional `exec` and `publish`. |
+| `@cloudflare/computer/tools` | AI SDK tools for agents: `read`, `ls`, `find`, `grep`, `write`, `edit`, `delete`, and optional `exec` and `publish`. |
+| `@cloudflare/computer/tools/pi-ai` | `createPiTools()`: the same tool set for pi (`@earendil-works/pi-ai`). |
+| `@cloudflare/computer/tools/tanstack-ai` | `createTanStackTools()`: the same tool set for TanStack AI (`@tanstack/ai`). |
 | `@cloudflare/computer/git` | Opt-in `isomorphic-git` glue for checkouts inside the workspace. |
 | `@cloudflare/computer/assets` | `createAssets` — share a workspace file to R2 as a presigned URL. |
-| `@cloudflare/computer/artifacts` | `createArtifact` and its CLI, a session-scoped facade over the Cloudflare Artifacts binding. |
+| `@cloudflare/computer/artifacts` | `createArtifact` and its CLI, an optionally session-scoped wrapper over the Cloudflare Artifacts binding. |
 | `@cloudflare/computer/observe/cloudflare` | Cloudflare-runtime adapter for the observability hook. |
 
 A consumer that only uses the container backend never imports the worker
@@ -413,7 +464,7 @@ const ws = new Workspace({
   storage: ctx.storage,
   backends: [
     new WorkerShellBackend({ id: "shell", loader: env.LOADER, /* ... */ }),
-    new CloudflareContainerBackend({ id: "sandbox", container: () => this, /* ... */ }),
+    new LegacyContainerBackend({ id: "sandbox", container: () => this, /* ... */ }),
   ],
 });
 
@@ -446,16 +497,18 @@ When assigning a workspace to a Think agent's `workspace`, pass
 `useThink: true` so Think's compatibility methods are added alongside
 `workspace.fs` and `workspace.runtime`.
 
-### Durable pending-sync retries
+### Resuming an incomplete sync
 
 A command can change backend files and then have its post-command pull
-fail; the result exposes `sync: { status: "pending", ... }`. Configure a
-`SyncRetryScheduler` on `Workspace` to persist one coalesced retry per
-backend, then call `workspace.retryPendingSync(backend)` from your DO's
-alarm. Retries use bounded exponential backoff and return `"exhausted"`
-after the configured maximum. The library does not own your DO's alarm.
-See `SyncRetryScheduler`, `SyncRetryIntent`, and `SyncRetryOptions` in
-the package exports.
+fail; the result exposes `sync: { status: "pending", ... }`. Nothing
+further is required to recover it. The sync operation and its watermark
+hold the progress durably, so the next `pull()` resumes from where the
+failed one stopped and drains the rest of the fixed target.
+
+A deferred exec fixes that target when the command finishes, which pins
+the command's changes rather than capturing a newer target that could
+have raced ahead. Attempt counts, backoff, and exhaustion are not part
+of the API: a caller that wants to stop trying stops iterating.
 
 ### Observability
 
@@ -476,7 +529,7 @@ An adapter for the Cloudflare runtime lives at
   No container.
 - [`examples/worker-javascript`](../../examples/worker-javascript) — the
   same shape, running ECMAScript modules instead of shell commands.
-- [`examples/container`](../../examples/container) — the container
+- [`examples/container-legacy`](../../examples/container-legacy) — the container
   backend running `computerd`.
 - [`examples/think`](../../examples/think) — a chat agent that uses the
   workspace as its working directory.

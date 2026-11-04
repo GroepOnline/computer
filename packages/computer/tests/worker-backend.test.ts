@@ -111,6 +111,17 @@ describe("WorkerShellBackend end-to-end", () => {
     expect(text).toBe("from inside the shell\n");
   });
 
+  it("moves a file with mv through the host's rename over Workers RPC", async () => {
+    const id = freshId();
+    await write(id, "/workspace/old.txt", "payload");
+    // `test -e` on the source proves the adapter renamed rather than
+    // copying and leaving both ends behind.
+    const result = await exec(id, "mv old.txt new.txt && cat new.txt && test -e old.txt");
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).toBe("payload");
+    expect(await read(id, "/workspace/new.txt")).toBe("payload");
+  });
+
   it("reports a non-zero exit code with stderr captured", async () => {
     const id = freshId();
     const result = await exec(id, "ls /nope 2>&1; echo done");
@@ -118,6 +129,22 @@ describe("WorkerShellBackend end-to-end", () => {
     // shell carries on past the `;` and emits `done` on stdout.
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/done/);
+  });
+
+  it("registers curl on the fetch path when its group is imported", async () => {
+    // The harness opts curl in by passing the imported curl group
+    // to WorkerBackend's `commands`. ShellWorker wires curl to a
+    // SecureFetch over the isolate's global fetch (no undici). A
+    // registered curl with no URL fails its own arg check ("curl:
+    // no URL specified"); an unregistered command would instead be
+    // reported as not found. This proves the fetch-path curl is
+    // wired without depending on egress, which globalOutbound keeps
+    // closed.
+    const id = freshId();
+    const result = await exec(id, "curl 2>&1; echo done");
+    expect(result.stdout).toMatch(/done/);
+    expect(result.stdout).toMatch(/curl: no URL specified/);
+    expect(result.stdout).not.toMatch(/command not found/);
   });
 
   it("isolates state between separate workspace ids", async () => {

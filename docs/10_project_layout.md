@@ -16,7 +16,7 @@ The workspace ships as a monorepo. Each published package lives under
 ```
 computer/
 ├── packages/
-│   ├── computer/                       # @cloudflare/computer — DO-side facade, backends, proxy
+│   ├── computer/                       # @cloudflare/computer — DO-side wrapper, backends, proxy
 │   ├── dofs/                           # @cloudflare/dofs — SQLite-backed VFS + sync
 │   ├── rpc/                            # @cloudflare/computer-rpc — capnweb wire interface
 │   ├── computerd/                      # @cloudflare/computerd — in-container daemon (binary)
@@ -40,7 +40,7 @@ they refer to the same code under the new names.
 
 ## `packages/computer/` — `@cloudflare/computer`
 
-The DO-side facade. Owns the `Workspace` class, re-exports
+The DO-side wrapper. Owns the `Workspace` class, re-exports
 `WorkspaceFilesystem` from `@cloudflare/dofs`, exposes the public
 `WorkspaceRuntime` surface, and routes execution across command and
 module backends. It also ships the `WorkspaceProxy` used by clients
@@ -50,7 +50,7 @@ that talk to a workspace through an RPC stub.
 packages/computer/
 ├── src/
 │   ├── index.ts                     # Public entrypoint
-│   ├── workspace.ts                 # Workspace facade
+│   ├── workspace.ts                 # Workspace wrapper
 │   ├── runtime/                     # Public runtime router and capabilities
 │   ├── shell.ts                     # Internal command-backend adapter
 │   ├── backend.ts                   # Command backend interface
@@ -72,7 +72,7 @@ packages/computer/
 └── package.json
 ```
 
-The package builds ESM and declarations with Rolldown. Public entrypoints include the root facade, tools, Git, assets, artifacts, the Container, Worker shell, and Worker JavaScript backends, and Cloudflare observability. The injected service is the separate `computerd` package, and shared wire types live in `@cloudflare/computer-rpc`.
+The package builds ESM and declarations with Rolldown. Public entrypoints include the root export, tools, Git, assets, artifacts, the Container, Worker shell, and Worker JavaScript backends, and Cloudflare observability. The injected service is the separate `computerd` package, and shared wire types live in `@cloudflare/computer-rpc`.
 
 ## `packages/dofs/` — `@cloudflare/dofs`
 
@@ -175,10 +175,17 @@ produces the Node SEA single-file binary at
 
 ## Tools
 
-AI SDK tools (`read`, `write`, `edit`, `ls`, optional `exec`, and
-optional `publish`) ship from the `@cloudflare/computer/tools` subpath
-rather than a separate package, under
-[`packages/computer/src/tools/`](../packages/computer/src/tools/). See
+Agent tools (`read`, `write`, `edit`, `ls`, optional `exec`, and optional
+`publish`) ship from the package rather than a separate one, with one
+entry point per agent library: `createAITools()` from
+`@cloudflare/computer/tools`, `createPiTools()` from
+`@cloudflare/computer/tools/pi-ai`, and `createTanStackTools()` from
+`@cloudflare/computer/tools/tanstack-ai`. The individual AI SDK
+`create*Tool` functions come from `@cloudflare/computer/tools` too. They live under
+[`packages/computer/src/tools/`](../packages/computer/src/tools/):
+`common/` holds each tool's schema, description, and executor with no
+agent library in it, and `ai-sdk/`, `pi-ai/`, and `tanstack-ai/` wrap
+those in each library's tool shape. See
 [09. Tool Interface (Agents)](./09_tool_interface.md).
 
 ## Git

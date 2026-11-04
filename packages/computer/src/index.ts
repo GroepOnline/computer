@@ -2,19 +2,20 @@
 //
 // The package runs inside a Cloudflare Worker / Durable
 // Object. It picks a backend, holds a SyncRPC connection to
-// computerd, and exposes a file-shaped facade.
+// computerd, and exposes a file-shaped wrapper.
 //
 // Backends ship under sub-path entries so the large built
 // dependencies they carry (a bundled just-bash for the worker
 // backend, etc.) can be tree-shaken when a consumer only uses
 // one of them:
 //
-//   import { CloudflareContainerBackend } from "@cloudflare/computer/backends/container";
+//   import { LegacyContainerBackend } from "@cloudflare/computer/backends/container-legacy";
 //   import { WorkerShellBackend }         from "@cloudflare/computer/backends/worker-shell";
 //
 // TestBackend stays on the main entry because it's a thin
 // test-only fake with no payload.
 
+export type { SyncProgress } from "@cloudflare/computer-rpc/driver";
 export type {
   ApplyResult,
   DurableObjectStorageLike,
@@ -44,6 +45,17 @@ export type {
   MountWriteAPI,
 } from "./mounts/types.js";
 export {
+  createSyncLogger,
+  DEFAULT_CPU_LIMIT_MS,
+  type SyncBlockTelemetry,
+  type SyncLogger,
+  type SyncLoggerOptions,
+  type SyncOperationTelemetry,
+  syncBlockLog,
+  syncOperationLog,
+  type TelemetryRecord,
+} from "./observe/sync-telemetry.js";
+export {
   noopObserver,
   type WorkspaceAttributes,
   type WorkspaceAttributeValue,
@@ -57,6 +69,7 @@ export {
   WorkspaceServiceProxy,
   type WorkspaceServiceProxyProps,
 } from "./proxy.js";
+export type { WorkspaceEgressPolicy } from "./runtime/egress.js";
 export type {
   ModuleExecutionEnvelope,
   ModuleExecutionInput,
@@ -95,12 +108,8 @@ export {
   withWorkspace,
 } from "./with-workspace.js";
 export {
-  type SyncRetryIntent,
-  type SyncRetryOptions,
-  type SyncRetryScheduler,
   type ThinkWorkspaceCompatibility,
   Workspace,
   type WorkspaceGitFactory,
   type WorkspaceOptions,
-  type WorkspaceRetryPendingSyncResult,
 } from "./workspace.js";

@@ -1,16 +1,18 @@
-import { mkdir } from "../fs/mkdir.js";
+import { mkdir, mkdirForSyncParents } from "../fs/mkdir.js";
 import { readOnlyRootFor } from "../fs/mount-guard.js";
-import { resolveInode } from "../fs/resolve.js";
+import { resolveInode, resolveInodeWithoutSymlinks } from "../fs/resolve.js";
 import { invalidateResolveSubtree } from "../fs/resolveCache.js";
 import { rm } from "../fs/rm.js";
 import { symlink } from "../fs/symlink.js";
 import { unlinkDirent } from "../fs/unlink.js";
-import { writeFile, writeFileSync } from "../fs/writeFile.js";
+import { assertChunkWindows, linkStagedChunksSync } from "../fs/writeFile.js";
 import { canonicalizePath } from "../path.js";
 import { incrementRev } from "../rev.js";
 import type { Database } from "../storage.js";
+import { stageBlob } from "./blobs.js";
 import type { ChangeEntry } from "./changes.js";
 import { computeManifestHash } from "./manifests.js";
+import { pathOf } from "./paths.js";
 
 // One container-side change that landed under a read-only mount and
 // was therefore skipped rather than applied. Callers (the workspace
@@ -209,6 +211,47 @@ function applyDirectoryEntry(db: Database, entry: Extract<ChangeEntry, { kind: "
   });
 }
 
+function ensureParentDirectories(
+  db: Database,
+  path: string,
+  mtime: number,
+): { path: string; blockingRoot?: string } {
+  const { parts, path: canonical } = canonicalizePath(path);
+  if (parts.length < 2) return { path: canonical };
+  const parentPath = `/${parts.slice(0, -1).join("/")}`;
+
+  const parent = resolveInodeWithoutSymlinks(db, parentPath);
+  if (parent?.type === "dir") return { path: canonical };
+
+  const reachableParent = resolveInode(db, parentPath);
+  if (reachableParent?.type === "dir") {
+    const resolvedParentPath = pathOf(db, reachableParent.inode);
+    if (resolvedParentPath === null) {
+      throw new Error(`applyChanges: resolved parent is unreachable for ${canonical}`);
+    }
+    const leafName = parts[parts.length - 1];
+    const resolvedPath =
+      resolvedParentPath === "/" ? `/${leafName}` : `${resolvedParentPath}/${leafName}`;
+    return { path: resolvedPath, blockingRoot: readOnlyRootFor(db, resolvedPath) };
+  }
+
+  for (let i = 0; i < parts.length - 1; i++) {
+    const ancestorPath = `/${parts.slice(0, i + 1).join("/")}`;
+    const ancestor = resolveInode(db, ancestorPath, { followSymlinks: false });
+    if (ancestor === null) {
+      mkdirForSyncParents(db, parentPath, { recursive: true }, () => mtime);
+      return { path: canonical };
+    }
+    if (ancestor.type === "dir") continue;
+    const blockingRoot = readOnlyRootFor(db, ancestorPath);
+    if (blockingRoot !== undefined) return { path: canonical, blockingRoot };
+    removeInodeTreeAtPath(db, ancestorPath, ancestor.inode, ancestor.type);
+    mkdirForSyncParents(db, parentPath, { recursive: true }, () => mtime);
+    return { path: canonical };
+  }
+  return { path: canonical };
+}
+
 // Drive a ChangeEntry stream against `db`, batching writes so peak
 // memory stays bounded and a crash mid-apply leaves the DB in a
 // consistent state. Each batch runs inside a single transactionSync
@@ -248,6 +291,11 @@ export async function applyChanges(
     if (options.source === "upstream" && entry.kind !== "delete") {
       if (alreadyApplied(db, entry)) continue;
     }
+    // A replayed tombstone must not delete a path that was recreated
+    // above the tombstone's revision.
+    if (options.source === "upstream" && entry.kind === "delete" && tombstoneIsStale(db, entry)) {
+      continue;
+    }
     // Read-only mount guard. Entries under a registered read-only
     // mount root are surfaced via the return value and not applied.
     // The owning workspace's surface (Workspace.pull, exec()) folds
@@ -275,51 +323,52 @@ export async function applyChanges(
       continue;
     }
     if (entry.kind === "dir") {
-      applyDirectoryEntry(db, entry);
+      const parentResult = ensureParentDirectories(db, entry.path, entry.mtime);
+      if (parentResult.blockingRoot !== undefined) {
+        skipped.push({
+          path: entry.path,
+          mountRoot: parentResult.blockingRoot,
+          op: "write",
+          reason: "read-only",
+        });
+        continue;
+      }
+      applyDirectoryEntry(db, { ...entry, path: parentResult.path });
       applied++;
       pathsInBatch++;
       if (pathsInBatch >= maxPaths) flush();
       continue;
     }
     if (entry.kind === "symlink") {
-      removeReplaceableFinalEntry(db, entry.path, "symlink");
-      symlink(db, entry.target, entry.path, () => entry.mtime);
+      const parentResult = ensureParentDirectories(db, entry.path, entry.mtime);
+      if (parentResult.blockingRoot !== undefined) {
+        skipped.push({
+          path: entry.path,
+          mountRoot: parentResult.blockingRoot,
+          op: "write",
+          reason: "read-only",
+        });
+        continue;
+      }
+      removeReplaceableFinalEntry(db, parentResult.path, "symlink");
+      symlink(db, entry.target, parentResult.path, () => entry.mtime);
       applied++;
       pathsInBatch++;
       if (pathsInBatch >= maxPaths) flush();
       continue;
     }
-    // file: assemble chunk bytes. First check the in-memory map
-    // (the streaming hand-off); fall back to vfs_blob_bytes (the
-    // staged-via-pushObjects path).
-    const parts: Uint8Array[] = [];
-    let total = 0;
-    for (const c of entry.chunks) {
-      const k = hex(c.hash);
-      let bytes = objects.get(k);
-      if (bytes === undefined) {
-        const row = db.one<{ bytes: Uint8Array }>(
-          "SELECT bytes FROM vfs_blob_bytes WHERE hash = ?",
-          c.hash,
-        );
-        bytes = row?.bytes;
-      }
-      if (bytes === undefined) {
-        throw new Error(`applyChanges: missing object ${k} for ${entry.path}`);
-      }
-      parts.push(bytes);
-      total += bytes.byteLength;
+    const fileResult = applyFileEntry(db, entry, objects);
+    if (fileResult.blockingRoot !== undefined) {
+      skipped.push({
+        path: entry.path,
+        mountRoot: fileResult.blockingRoot,
+        op: "write",
+        reason: "read-only",
+      });
+      continue;
     }
-    const buf = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) {
-      buf.set(p, off);
-      off += p.byteLength;
-    }
-    removeReplaceableFinalEntry(db, entry.path, "file");
-    await writeFile(db, entry.path, buf, { mode: entry.mode }, () => entry.mtime);
     applied++;
-    bytesInBatch += total;
+    bytesInBatch += fileResult.total;
     pathsInBatch++;
     if (bytesInBatch >= maxBytes || pathsInBatch >= maxPaths) flush();
   }
@@ -372,6 +421,11 @@ export function applyChangesSync(
     if (options.source === "upstream" && entry.kind !== "delete") {
       if (alreadyApplied(db, entry)) continue;
     }
+    // See tombstoneIsStale: a replayed delete must not clobber a
+    // newer local recreation.
+    if (options.source === "upstream" && entry.kind === "delete" && tombstoneIsStale(db, entry)) {
+      continue;
+    }
     const blockingRoot = readOnlyRootFor(db, entry.path);
     if (blockingRoot !== undefined) {
       skipped.push({
@@ -394,48 +448,52 @@ export function applyChangesSync(
       continue;
     }
     if (entry.kind === "dir") {
-      applyDirectoryEntry(db, entry);
+      const parentResult = ensureParentDirectories(db, entry.path, entry.mtime);
+      if (parentResult.blockingRoot !== undefined) {
+        skipped.push({
+          path: entry.path,
+          mountRoot: parentResult.blockingRoot,
+          op: "write",
+          reason: "read-only",
+        });
+        continue;
+      }
+      applyDirectoryEntry(db, { ...entry, path: parentResult.path });
       applied++;
       pathsInBatch++;
       if (pathsInBatch >= maxPaths) flush();
       continue;
     }
     if (entry.kind === "symlink") {
-      removeReplaceableFinalEntry(db, entry.path, "symlink");
-      symlink(db, entry.target, entry.path, () => entry.mtime);
+      const parentResult = ensureParentDirectories(db, entry.path, entry.mtime);
+      if (parentResult.blockingRoot !== undefined) {
+        skipped.push({
+          path: entry.path,
+          mountRoot: parentResult.blockingRoot,
+          op: "write",
+          reason: "read-only",
+        });
+        continue;
+      }
+      removeReplaceableFinalEntry(db, parentResult.path, "symlink");
+      symlink(db, entry.target, parentResult.path, () => entry.mtime);
       applied++;
       pathsInBatch++;
       if (pathsInBatch >= maxPaths) flush();
       continue;
     }
-    const parts: Uint8Array[] = [];
-    let total = 0;
-    for (const c of entry.chunks) {
-      const k = hex(c.hash);
-      let bytes = objects.get(k);
-      if (bytes === undefined) {
-        const row = db.one<{ bytes: Uint8Array }>(
-          "SELECT bytes FROM vfs_blob_bytes WHERE hash = ?",
-          c.hash,
-        );
-        bytes = row?.bytes;
-      }
-      if (bytes === undefined) {
-        throw new Error(`applyChanges: missing object ${k} for ${entry.path}`);
-      }
-      parts.push(bytes);
-      total += bytes.byteLength;
+    const fileResult = applyFileEntry(db, entry, objects);
+    if (fileResult.blockingRoot !== undefined) {
+      skipped.push({
+        path: entry.path,
+        mountRoot: fileResult.blockingRoot,
+        op: "write",
+        reason: "read-only",
+      });
+      continue;
     }
-    const buf = new Uint8Array(total);
-    let off = 0;
-    for (const p of parts) {
-      buf.set(p, off);
-      off += p.byteLength;
-    }
-    removeReplaceableFinalEntry(db, entry.path, "file");
-    writeFileSync(db, entry.path, buf, { mode: entry.mode }, () => entry.mtime);
     applied++;
-    bytesInBatch += total;
+    bytesInBatch += fileResult.total;
     pathsInBatch++;
     if (bytesInBatch >= maxBytes || pathsInBatch >= maxPaths) flush();
   }
@@ -446,6 +504,90 @@ export function applyChangesSync(
   // extra push per apply keeps the cross-side invariant intact.
 
   return { applied, skipped };
+}
+
+// Link a file entry to staged chunks without loading payload bytes.
+// In-memory objects are staged individually before the link. Declared
+// sizes are validated without loading payloads; chunk hashes remain
+// trusted here, matching stageBlob's existing contract.
+//
+// Every check runs before removeReplaceableFinalEntry, so a rejected
+// entry leaves whatever was already at the path alone. Batches are a
+// sequence of independent transactions, so a throw part way through
+// does not roll the removal back.
+function applyFileEntry(
+  db: Database,
+  entry: Extract<ChangeEntry, { kind: "file" }>,
+  objects: Map<string, Uint8Array>,
+): { total: number; blockingRoot?: string } {
+  assertChunkWindows(entry.chunks, entry.path);
+  let total = 0;
+  for (const c of entry.chunks) {
+    total += c.size;
+    const staged = stagedBlobSize(db, c.hash);
+    if (staged === undefined) {
+      const k = hex(c.hash);
+      const bytes = objects.get(k);
+      if (bytes === undefined) {
+        throw new Error(`applyChanges: missing object ${k} for ${entry.path}`);
+      }
+      assertChunkSize(bytes.byteLength, c.size, c.hash, entry.path);
+      stageBlob(db, c.hash, bytes, entry.mtime);
+      continue;
+    }
+    assertChunkSize(staged, c.size, c.hash, entry.path);
+  }
+  const parentResult = ensureParentDirectories(db, entry.path, entry.mtime);
+  if (parentResult.blockingRoot !== undefined) {
+    return { total, blockingRoot: parentResult.blockingRoot };
+  }
+  removeReplaceableFinalEntry(db, parentResult.path, "file");
+  const { parts, path: canonical } = canonicalizePath(parentResult.path);
+  linkStagedChunksSync(db, canonical, parts, entry.chunks, { mode: entry.mode }, entry.mtime);
+  return { total };
+}
+
+// Return a staged chunk's size without loading its payload bytes.
+// A short byte row is treated as an interrupted write.
+function stagedBlobSize(db: Database, hash: Uint8Array): number | undefined {
+  return db.one<{ size: number }>(
+    `SELECT b.size AS size
+       FROM vfs_blobs b
+       JOIN vfs_blob_bytes bb ON bb.hash = b.hash
+      WHERE b.hash = ?
+        AND length(bb.bytes) = b.size`,
+    hash,
+  )?.size;
+}
+
+function assertChunkSize(actual: number, declared: number, hash: Uint8Array, path: string): void {
+  if (actual === declared) return;
+  throw new Error(
+    `applyChanges: chunk ${hex(hash)} for ${path} declares ${declared} bytes but holds ${actual}`,
+  );
+}
+
+// Decide whether an upstream tombstone may delete the live path.
+//
+// A tombstone describes the path as of the revision it was stamped
+// with. Because the sync cursor only advances after a block applies,
+// any block interrupted before its acknowledgment is replayed — and a
+// replayed tombstone whose path was recreated locally in the meantime
+// would destroy content the tombstone never described.
+//
+// The guard is a revision comparison: apply the delete only when the
+// live path is no newer than the tombstone. A path recreated above the
+// tombstone's rev is newer information than the delete, so the delete
+// is stale and dropped. It is not lost work — the recreation is itself
+// a change that the next push ships upstream.
+//
+// Local deletes are exempt. They are authored here, not replayed, so
+// there is no earlier revision to compare against.
+function tombstoneIsStale(db: Database, entry: ChangeEntry & { kind: "delete" }): boolean {
+  const live = resolveInode(db, entry.path, { followSymlinks: false });
+  if (live === null) return false;
+  const row = db.one<{ rev: number }>("SELECT rev FROM vfs_nodes WHERE inode = ?", live.inode);
+  return row !== undefined && row.rev > entry.rev;
 }
 
 // Compare an entry against the local node graph. Returns true when

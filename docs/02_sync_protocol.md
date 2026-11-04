@@ -222,6 +222,148 @@ in-process state. A regression in the post-apply cursor advancement
 path trips the assertion on the next push or pull rather than
 corrupting data silently.
 
+## Restartable synchronization
+
+A large sync cannot assume it finishes in one invocation. A Durable
+Object can be evicted between two steps, an alarm has a hard cutoff,
+and a JavaScript generator survives neither. `Workspace.pull()`
+and `Workspace.push()` therefore treat the iterator as
+disposable and SQLite as the durability surface.
+
+One `next()` performs one complete block: plan it, transfer it, apply
+it, persist the cursor, yield. No RPC stream stays open across a yield,
+because the caller may never return. Recreating the iterable resumes
+from durable state, so these two lines are equivalent to iterating
+twice on one iterator:
+
+```ts
+await workspace.pull()[Symbol.asyncIterator]().next();
+// Durable Object may be evicted here.
+await workspace.pull()[Symbol.asyncIterator]().next();
+```
+
+Durable state lives in two places. `_vfs_sync_operations` holds one row
+per `(backend, direction)` carrying the fixed target, the generation
+that fences superseded executions, and the block sizing profile. The
+committed progress cursor stays in the watermark tables above, because
+filesystem application and cursor advancement have to commit together.
+The operation row records where a sync is going; the watermark records
+how far it got.
+
+Callers pass no cursor, target, or budget. Block sizing is internal and
+shrinks automatically when a block is detected as interrupted, so a
+caller cannot ask for a block too large to complete.
+
+### The library never owns an alarm
+
+`Workspace` does not call `setAlarm` or `deleteAlarm`. Scheduling
+belongs to the application, which knows what else its alarm is for.
+A strict one-step handler gives each block a fresh CPU allowance:
+
+```ts
+async alarm() {
+  // Leave a durable watchdog before entering a block. A hard reset
+  // cannot erase this future invocation.
+  await this.ctx.storage.setAlarm(Date.now() + 30_000);
+
+  const iterator = this.workspace.pull()[Symbol.asyncIterator]();
+  const { value, done } = await iterator.next();
+
+  if (done || value.complete) {
+    await this.ctx.storage.deleteAlarm();
+  } else {
+    await this.ctx.storage.setAlarm(Date.now() + 1_000);
+  }
+}
+```
+
+Completion is exposed on the yielded value rather than only through a
+following `done: true`, so a one-step handler can decide whether to
+reschedule without paying for a second `next()`.
+
+An application that would rather drive several blocks per invocation
+owns that wall-time budget too:
+
+```ts
+async alarm() {
+  const stopAt = Date.now() + 12 * 60_000;
+  await this.ctx.storage.setAlarm(Date.now() + 30_000);
+
+  for await (const progress of this.workspace.pull()) {
+    if (progress.complete) return;
+    if (Date.now() >= stopAt) {
+      await this.ctx.storage.setAlarm(Date.now() + 1_000);
+      return;
+    }
+  }
+}
+```
+
+Breaking out of either loop stops local driving without failing the
+operation. The last yielded cursor stays durable and a later iterable
+resumes from it. The corollary is that the library cannot guarantee
+convergence if the application never calls it again — that is the
+deliberate price of leaving scheduling to the implementor.
+
+### Entry mode and pack mode
+
+Small windows ship one `ChangeEntry` at a time, with a `hasObjects`
+probe and a `fetchObjects` pull for the bytes the receiver lacks. That
+is cheap for a handful of changes and hopeless for tens of thousands of
+them.
+
+Above either threshold the operation switches to a **change pack**: one
+gzip stream carrying the entries interleaved with the unique objects
+they reference, so a block needs no object round trips at all.
+
+| Threshold | Value |
+| --- | --- |
+| Entries in the cursor window | 20,000 |
+| Estimated payload bytes | 100 MiB |
+
+Selection happens once per operation and is persisted on the operation
+row. The mode cannot change mid-operation: a block's encoding must not
+depend on when it was requested, or a replayed block would not match
+the original and the receiver could not absorb it as a no-op. Since the
+target is fixed at creation, the window cannot grow underneath the
+estimate.
+
+Pack framing is length-prefixed records inside the gzip stream, closed
+by a footer carrying the start cursor, block cursor, target, generation,
+counts, and a digest. A truncated or tampered pack is rejected as a
+protocol error before anything applies, leaving the cursor untouched —
+advancing over entries that never arrived would lose them silently.
+
+`fetchChangePack` and `applyChangePack` are optional on `SyncRPC`. A
+peer that predates them keeps working in entry mode, so the two sides
+can be deployed in either order.
+
+### Replay and idempotency
+
+Because the cursor advances only after a block applies, any block
+interrupted before its acknowledgment is re-applied. Replay safety is
+per entry kind rather than a blanket property:
+
+| Entry | Replay behavior |
+| --- | --- |
+| `file` | `alreadyApplied` compares the manifest hash; identical content is a no-op. |
+| `dir` | Compares mode; a match is a no-op. |
+| `symlink` | Compares mode and target; a match is a no-op. |
+| `delete` | Compares the tombstone's rev against the live inode's. A path recreated **above** the tombstone rev is newer information, so the delete is dropped. |
+
+The delete case is why replay cannot be assumed idempotent for free. A
+tombstone describes a path as of the rev it was stamped with; replaying
+it against a newer local recreation would destroy data the tombstone
+never described. The recreation is itself a change the next push ships
+upstream, so dropping the stale delete loses no work.
+
+Entries the receiver refuses — most often a container-side write under
+a read-only mount — are reported in `SyncProgress.skipped` **and**
+written to `_vfs_sync_skips`. The cursor advances past them, because an
+entry that can never apply would otherwise stall the operation forever.
+Recording them durably keeps the drop auditable rather than visible
+only to whoever happened to read that one progress value.
+
 ## Wire shape
 
 The wire is symmetric: push and fetch both move `ChangeEntry`
@@ -267,11 +409,8 @@ edited file) shows up exactly once on the wire. See
 
 ## Failure handling
 
-- **Container restart mid-exec.** The DO's connection detects the
-  closed WebSocket and self-destructs. The next call transparently
-  rebuilds against the still-running `computerd` (or restarts it if needed).
-  `pushRev` and the fetch cursor mean the catch-up is incremental, modulo
-  whatever the container's deployment chose for its DB lifetime.
+- **Container restart or transport loss.** The Durable Object detects the closed WebSocket, removes and closes the stale backend handle, and reconnects through the normal computerd health gate. `pushOnce` and `pullOnce` get one reconnect retry inside the original logical operation. `pushRev` and the fetch cursor make those retries idempotent: a torn push replays entries whose watermark did not advance, while a torn pull resumes after its last committed batch. A fresh process-lifetime computerd database resets the matching local watermarks before the replacement handle is exposed, so the next push rebuilds it from a rev-0 baseline.
+- **Container restart during command execution.** The pre-exec push must succeed, including its reconnect retry, before `shell.exec` is called. A locally disposed stub proves that a spawn request was never sent and permits one reconnect retry. A generic disconnect after dispatch is ambiguous, so the backend invalidates the handle and reports that the command may have started instead of replaying it. Event-stream failures follow the same no-replay rule. The post-command pull remains safe to retry only against the runtime UUID that ran the command. If reconnect reaches a replacement container, the execution result reports pending sync rather than treating its empty VFS as a successful zero-entry pull. The durable retry intent retains the original runtime UUID. When a scheduled retry confirms that runtime is gone, it reports the sync as lost and clears the unrecoverable intent so later commands on the live runtime can schedule their own pending pulls.
 - **Container crash mid-apply.** `push` is atomic from the DO's
   perspective on the receiver: the server wraps the whole batch in a
   single `db.transactionSync` via the synchronous `applyChangesSync`
@@ -295,7 +434,7 @@ edited file) shows up exactly once on the wire. See
   go through a per-Workspace tail-promise FIFO. Two concurrent
   callers queue — the second can't enter `pushOnce` / `pullOnce`
   until the first has resolved or rejected. A command's pre-exec push
-  and post-stream pull each use this facade, but the FIFO is not held
+  and post-stream pull each use this wrapper, but the FIFO is not held
   for the command's lifetime: overlapping commands and explicit sync
   calls are not one transaction. Rejections aren't contagious: a
   failed mutation surfaces its error to its own caller without
@@ -408,55 +547,32 @@ first-class conflict primitives.
 
 ## Ignore lists
 
+The optional `ignore` list hides matching path segments from a sync
+stream. Filtering is opt-in and applies only while coalescing changes
+for the wire; the filesystem retains and exposes the paths normally.
+An ignored path is therefore not deleted or hidden from `Workspace.fs`,
+but it is omitted from that particular pull. This is useful for large
+directories of derived files such as `.next`, `target`, `__pycache__`,
+or `dist`.
 
-The `ignore` option hides path segments from the pull. Excluded
-paths are still written and read inside the container — the bytes just
-never cross the wire back to the DO. This is essential for any large
-directory of derived files: `node_modules`, `.next`, `target`,
-`__pycache__`, `dist`. Without an ignore, a single `npm install` would
-push tens of thousands of small files through the sync wire on the
-next pull.
+The default is `[]`. A caller-supplied list replaces the configured
+list for that fetch. Pass an explicit list when a sync peer should omit
+paths, or pass `[]` to include every path. To omit `node_modules`, for
+example, configure `ignore: ["node_modules"]` explicitly.
 
-The default is `["node_modules"]`, applied server-side when `ignore` is
-omitted. A caller-supplied list **replaces** the default — it does not
-extend it. Pass `[]` to disable ignoring entirely, or pass your full
-list (including `"node_modules"` if you still want it) to customise.
+### Filtered entries
 
-### Ignored entries
-
-Ignored paths are **invisible to the `Workspace.fs` API**. They do not
-appear in `readdir`, `stat` returns `ENOENT`, and `readFile` returns
-`ENOENT`. The bytes still live inside the container, so anything that
-*uses* the ignored files — `exec("node ...")`, build tools, anything
-running container-side — keeps working. The exclusion only affects what
-crosses the wire **and** what the DO-side API surfaces.
-
-This is a deliberately narrow surface for the initial release. Whether
-ignored entries should be representable to the DO at all (as stubs, as
-a separate shell-only namespace, or not at all) is left to a future
-iteration — see [Future considerations](#future-considerations).
+Filtering affects only the change stream. Files remain readable and
+writable through `Workspace.fs`, and container-side commands such as
+`exec("node ...")` can use them normally. Filtered entries still advance
+the receiving peer's fetch cursor, so an ignore configuration should be
+kept stable for a sync relationship; removing a pattern does not replay
+changes that were already filtered.
 
 ## Future considerations
 
 Items deferred from the initial design. File an issue if a real use
 case depends on a particular resolution.
-
-### Representing ignored entries to the DO
-
-Today ignored paths are entirely invisible to `Workspace.fs`. That is
-the simplest contract but it loses one piece of information: tools that
-want to enumerate "everything the agent's exec can see" can't get it
-from the DO. Two options worth weighing later:
-
-- **Stub entries with an `ignored` flag** on `stat()`, surfaced via
-  `readdir`. Easy to retrofit; surprising for tools that walk the tree
-  and don't check the flag.
-- **An explicit shell-only namespace** — e.g. `workspace.runtime.readdir`
-  returns container-only entries, `workspace.fs.readdir` stays clean.
-  Cleaner separation, larger API surface.
-
-Either way, the bytes never cross the wire; the question is purely how
-much the DO admits exists.
 
 ### Bloom/cuckoo filter over `vfs_blobs.hash`
 
@@ -470,9 +586,9 @@ needed; pure DO-side optimisation.
 ### Push backpressure
 
 A long-running exec can dirty container state faster than the DO can
-pull. Today's process-lifetime container VFS caps this by OOMing, which
-is a bad answer. Once a disk-backed container mirror lands the bound
-shifts to path count, but the same problem persists. Likely shape: a
+pull. An in-memory container VFS caps this by running out of memory.
+Setting `COMPUTERD_DB` to a file path shifts the limit to path count,
+but the same problem remains. Likely shape: a
 soft cap on the dirty set (say, 256 MiB pending bytes or 100k paths)
 above which FUSE write replies are delayed (real backpressure into the
 writer), or the container opportunistically initiates a push to the DO

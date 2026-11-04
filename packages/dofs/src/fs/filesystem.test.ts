@@ -9,24 +9,14 @@
 
 import { describe, expect, it } from "vitest";
 
-import { initializeSchema } from "../schema/index.js";
-import { Database } from "../storage.js";
-import { SQLiteTestStorage } from "../testing.js";
 import { WorkspaceFilesystem } from "./filesystem.js";
+import { withDB } from "./with-db.js";
 
 async function withFs<T>(
   fn: (fs: WorkspaceFilesystem) => T | Promise<T>,
   now: () => number = () => 1234,
 ): Promise<T> {
-  const storage = new SQLiteTestStorage();
-  const db = new Database(storage);
-  initializeSchema(db, now);
-  const fs = new WorkspaceFilesystem(db, { now });
-  try {
-    return await fn(fs);
-  } finally {
-    storage.close();
-  }
+  return withDB((db) => fn(new WorkspaceFilesystem(db, { now })), { now });
 }
 
 describe("WorkspaceFilesystem", () => {
@@ -122,6 +112,47 @@ describe("WorkspaceFilesystem", () => {
       await fs.writeFile("/tree/inner.txt", "i");
       await fs.rm("/tree", { recursive: true });
       await expect(fs.stat("/tree")).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  it("rename moves a file, a directory tree and a symbolic link", async () => {
+    await withFs(async (fs) => {
+      await fs.writeFile("/old.txt", "payload");
+      await fs.rename("/old.txt", "/new.txt");
+      expect(await fs.readFile("/new.txt", "utf8")).toBe("payload");
+      await expect(fs.stat("/old.txt")).rejects.toMatchObject({ code: "ENOENT" });
+
+      await fs.mkdir("/tree/inner", { recursive: true });
+      await fs.writeFile("/tree/inner/a.txt", "a");
+      await fs.rename("/tree", "/moved");
+      expect(await fs.readFile("/moved/inner/a.txt", "utf8")).toBe("a");
+      await expect(fs.stat("/tree")).rejects.toMatchObject({ code: "ENOENT" });
+
+      await fs.symlink("/new.txt", "/link");
+      await fs.rename("/link", "/link2");
+      expect(await fs.readlink("/link2")).toBe("/new.txt");
+    });
+  });
+
+  it("rename replaces a file and reports the documented errors", async () => {
+    await withFs(async (fs) => {
+      await fs.writeFile("/a.txt", "a");
+      await fs.writeFile("/b.txt", "b");
+      await fs.rename("/a.txt", "/b.txt");
+      expect(await fs.readFile("/b.txt", "utf8")).toBe("a");
+
+      await expect(fs.rename("/missing", "/elsewhere")).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.rename("/b.txt", "/no/such/dir/b.txt")).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+
+      await fs.mkdir("/full");
+      await fs.writeFile("/full/child", "c");
+      await fs.mkdir("/empty");
+      await expect(fs.rename("/empty", "/full")).rejects.toMatchObject({ code: "ENOTEMPTY" });
+      await expect(fs.rename("/b.txt", "/full")).rejects.toMatchObject({ code: "EISDIR" });
+      await expect(fs.rename("/full", "/b.txt")).rejects.toMatchObject({ code: "ENOTDIR" });
+      await expect(fs.rename("/b.txt", "/")).rejects.toMatchObject({ code: "EINVAL" });
     });
   });
 

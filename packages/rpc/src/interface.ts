@@ -28,8 +28,13 @@ export interface SyncRPC {
   // advances its fetch cursor to this completed rev after the apply
   // settles, and echoes that cursor back as `appliedPushCursor` so
   // the sender can assert applied covers pushed on every response.
-  push(input: { senderRev: number; changes: ReadableStream<ChangeEntry> }): Promise<{
+  push(input: {
+    senderRev: number;
+    senderCursor?: ChangeCursor;
+    changes: ReadableStream<ChangeEntry>;
+  }): Promise<{
     rev: number;
+    applied?: number;
     appliedPushCursor: ChangeCursor;
   }>;
 
@@ -45,7 +50,11 @@ export interface SyncRPC {
   //                       mirroring the same check on push.
   //
   // Per-file entries carry (hash, size) chunk lists; no bytes inline.
-  fetchChanges(input: { after?: ChangeCursor; ignore?: string[] }): Promise<{
+  fetchChanges(input: {
+    after?: ChangeCursor;
+    through?: ChangeCursor;
+    ignore?: string[];
+  }): Promise<{
     currentCursor: ChangeCursor;
     appliedPushCursor: ChangeCursor;
     stream: ReadableStream<ChangeEntry>;
@@ -62,8 +71,14 @@ export interface SyncRPC {
   //                 progress.
   //
   // pushRev / fetchCursor only move when the receiver is acting as
-  // a sync peer. Otherwise they sit at 0.
-  watermarks(): Promise<{ currentRev: number; pushRev: number; fetchCursor: ChangeCursor }>;
+  // a sync peer. Otherwise they sit at 0. Pass `settle: true` to run
+  // the receiver's pre-fetch reconciliation before currentRev is read;
+  // deferred command sync uses that as its durable target fence.
+  watermarks(input?: { settle?: boolean }): Promise<{
+    currentRev: number;
+    pushRev: number;
+    fetchCursor: ChangeCursor;
+  }>;
 
   // Materialise the receiver's view of a single path as a
   // ChangeEntry. Returns null when the path doesn't exist and
@@ -80,6 +95,43 @@ export interface SyncRPC {
   // set of chunk hashes in request order. Throws EUNKNOWN_HASH if
   // any hash is unknown — callers must dedupe and probe first.
   fetchObjects(hashes: Uint8Array[]): ReadableStream<{ hash: Uint8Array; bytes: Uint8Array }>;
+
+  // Bulk pull transport. Same cursor semantics as fetchChanges, but the
+  // response is one gzip change pack carrying entries interleaved with
+  // the objects they reference, rather than an entry stream the caller
+  // must follow with hasObjects / fetchObjects round trips.
+  //
+  // Selected automatically for large cursor windows; see the pack
+  // thresholds in @cloudflare/dofs. `maxEntries` and `maxBytes` bound
+  // the block so one pack stays inside the receiver's CPU budget, and
+  // `cursor` echoes the block cursor the pack's footer also carries.
+  // Optional: a peer built before pack transport omits these, and the
+  // engine falls back to entry mode when it finds them absent. That is
+  // what lets the two sides be deployed in either order.
+  fetchChangePack?(input: {
+    after?: ChangeCursor;
+    through?: ChangeCursor;
+    ignore?: string[];
+    maxEntries: number;
+    maxBytes: number;
+    generation: string;
+  }): Promise<{
+    cursor: ChangeCursor;
+    drained: boolean;
+    entryCount: number;
+    appliedPushCursor: ChangeCursor;
+    stream: ReadableStream<Uint8Array>;
+  }>;
+
+  // Bulk push transport, the mirror of fetchChangePack. The receiver
+  // decodes the pack, stages its objects, applies its entries, and
+  // echoes the cursor it applied so the sender can advance only through
+  // an acknowledgment.
+  applyChangePack?(input: { generation: string; stream: ReadableStream<Uint8Array> }): Promise<{
+    appliedPushCursor: ChangeCursor;
+    applied: number;
+    entryCount: number;
+  }>;
 
   // DO → container direction of object transfer. The DO streams the
   // bytes the container reported missing (via hasObjects) during a

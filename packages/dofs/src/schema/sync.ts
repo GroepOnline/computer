@@ -23,6 +23,23 @@ export const SYNC_STATEMENTS = [
   // index. Used on every recordDelete and on every push-tick that
   // processes tombstones.
   `CREATE INDEX IF NOT EXISTS vfs_changes_by_path ON vfs_changes(path, id DESC)`,
+  // coalesceChanges scans tombstones with
+  // `WHERE rev > ? AND op = 'delete' GROUP BY path`. Neither of the
+  // indexes above serves that: vfs_changes_by_rev(rev) can drive the
+  // range but leaves GROUP BY path to a sort, so the planner instead
+  // scans vfs_changes_by_path in path order and ignores the rev
+  // predicate entirely — reading the whole table to return the handful
+  // of rows in the watermark window.
+  //
+  // (op, rev) puts the equality column first and the range column
+  // second, which is the shape SQLite can drive both halves from. The
+  // GROUP BY still needs a temp b-tree, but the scan is now bounded by
+  // the rev window instead of the table.
+  //
+  // This only started to matter once node_modules entered the sync set:
+  // every reinstall appends thousands of tombstones and the table only
+  // grows. Added at schema v8; `schema/migrations.ts` owns the upgrade.
+  `CREATE INDEX IF NOT EXISTS vfs_changes_by_op_rev ON vfs_changes(op, rev)`,
   // Watermarks are keyed by (k, backend) so a workspace hosting
   // multiple backends keeps each backend's sync cursors
   // independent. The `backend` column was added at schema v3;
@@ -44,6 +61,65 @@ export const SYNC_STATEMENTS = [
     backend TEXT    NOT NULL DEFAULT 'default',
     path    TEXT,
     PRIMARY KEY (k, backend)
+  )`,
+  `CREATE TABLE IF NOT EXISTS _vfs_push_cursor (
+    k       TEXT    NOT NULL CHECK(k = 'push'),
+    backend TEXT    NOT NULL DEFAULT 'default',
+    rev     INTEGER NOT NULL DEFAULT 0,
+    path    TEXT,
+    PRIMARY KEY (k, backend)
+  )`,
+  // Durable half of a restartable sync operation. One row per
+  // (backend, direction): the plan's key. A restarted iterator reads
+  // this row to recover the fixed target and generation it was working
+  // against, because a JavaScript generator cannot survive eviction.
+  //
+  // `target_rev` / `target_path` are NULL only while status is
+  // 'capturing' — pull cannot capture its target atomically because
+  // watermarks({settle:true}) is a remote call, so capture is a
+  // two-phase insert-then-promote. `block_after_*` records where an
+  // in-flight block began and is cleared once the cursor advances; a
+  // later invocation that finds the marker with no cursor progress
+  // knows the prior execution was interrupted.
+  //
+  // The committed progress cursor stays in _vfs_watermark. This table
+  // never duplicates it.
+  `CREATE TABLE IF NOT EXISTS _vfs_sync_operations (
+    backend             TEXT    NOT NULL,
+    direction           TEXT    NOT NULL CHECK (direction IN ('pull', 'push')),
+    generation          TEXT    NOT NULL,
+    status              TEXT    NOT NULL CHECK (
+                          status IN ('capturing', 'pending', 'failed', 'lost')
+                        ),
+    target_rev          INTEGER,
+    target_path         TEXT,
+    runtime_id          TEXT,
+    mode                TEXT    CHECK (mode IN ('entries', 'pack')),
+    block_after_rev     INTEGER,
+    block_after_path    TEXT,
+    block_started_at    INTEGER,
+    internal_max_entries INTEGER NOT NULL,
+    internal_max_bytes  INTEGER NOT NULL,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    last_error          TEXT,
+    PRIMARY KEY (backend, direction)
+  )`,
+  // Entries the receiver deliberately refused, most often a
+  // container-side write under a read-only mount. The cursor advances
+  // past a rejection so the operation cannot stall on it forever,
+  // which means the only record of the drop would otherwise be a
+  // yielded progress value the caller may have discarded. These rows
+  // outlive the operation row and are pruned when a new generation
+  // starts. See docs/decisions/sync-operations.md.
+  `CREATE TABLE IF NOT EXISTS _vfs_sync_skips (
+    backend    TEXT    NOT NULL,
+    direction  TEXT    NOT NULL CHECK (direction IN ('pull', 'push')),
+    generation TEXT    NOT NULL,
+    path       TEXT    NOT NULL,
+    reason     TEXT    NOT NULL,
+    at         INTEGER NOT NULL,
+    PRIMARY KEY (backend, direction, generation, path)
   )`,
   // The `mode` column was added at schema v2; `schema/migrations.ts`
   // owns the ALTER for existing databases. Keep the CHECK

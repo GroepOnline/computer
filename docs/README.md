@@ -22,7 +22,7 @@ It provides:
  - Pluggable execution backends selected through `workspace.runtime`: a Cloudflare Container shell, a just-bash Dynamic Worker, or an isolated ECMAScript-module Dynamic Worker.
  - Isolated JavaScript with structured input/results, durable relative imports, configured libraries, durable `node:fs/promises`, trusted `ws:git` / `ws:artifacts`, and managed execution records.
  - Workspace constructable without a backend, for filesystem-only use cases.
- - Out-of-the-box AI SDK tools for `@cloudflare/agents` through `@cloudflare/computer/tools`.
+ - Out-of-the-box agent tools for the AI SDK (`createAITools()` in `@cloudflare/computer/tools`), pi (`createPiTools()` in `@cloudflare/computer/tools/pi-ai`), and TanStack AI (`createTanStackTools()` in `@cloudflare/computer/tools/tanstack-ai`).
 
 It comes with the following limitations:
 
@@ -42,13 +42,16 @@ The package ships several entrypoints:
 
 | Entrypoint | Purpose |
 | --- | --- |
-| `@cloudflare/computer` | The Workspace facade, first-class `workspace.runtime`, stub types, the R2 mount, and proxy classes. |
-| `@cloudflare/computer/backends/container` | `CloudflareContainerBackend` and `withWorkspaceContainer`. Pulls in the computerd / capnweb sync plumbing. |
+| `@cloudflare/computer` | The Workspace wrapper, first-class `workspace.runtime`, stub types, the R2 mount, and proxy classes. |
+| `@cloudflare/computer/backends/container` | `ContainerBackend` and `withWorkspaceContainer`, for a container the durable object schedules (`scheduling_policy: "durable_object"`). Same sync plumbing; the launch names the image and the instance size. |
+| `@cloudflare/computer/backends/container-legacy` | `LegacyContainerBackend` and `withLegacyWorkspaceContainer`, for a container the platform schedules and sizes from the containers block. |
 | `@cloudflare/computer/backends/worker-shell` | `WorkerShellBackend` and the bundled just-bash command runtime. |
 | `@cloudflare/computer/backends/worker-javascript` | `WorkerJavaScriptBackend`, configured libraries, durable relative imports, `node:fs/promises`, and trusted `ws:git` / `ws:artifacts`. |
 | `@cloudflare/computer/git` | Opt-in isomorphic-git glue for working with checkouts inside the workspace. Bundled lazily, with `pako` replaced by Workers `node:zlib`, and kept out of the default `@cloudflare/computer` graph. |
-| `@cloudflare/computer/artifacts` | `createArtifact`, a session-scoped facade over the Cloudflare Artifacts Workers binding, plus its argv CLI. |
+| `@cloudflare/computer/artifacts` | `createArtifact`, an optionally session-scoped wrapper over the Cloudflare Artifacts Workers binding, plus its argv CLI. |
 | `@cloudflare/computer/tools` | AI SDK tools for agents: read, write, edit, ls, optional exec, and optional publish. |
+| `@cloudflare/computer/tools/pi-ai` | `createPiTools()`: the same tool set for pi, as declarations plus a function that runs a tool call. |
+| `@cloudflare/computer/tools/tanstack-ai` | `createTanStackTools()`: the same tool set for TanStack AI, as the list `chat({ tools })` takes. |
 
 A consumer that only uses the container backend never imports the
 worker subpath, so the just-bash payload tree-shakes away.
@@ -63,7 +66,7 @@ copies the prebuilt binary out of the public GHCR image and into a thin
 Debian base:
 
 ```dockerfile
-FROM ghcr.io/cloudflare/computer-computerd-linux-x64:0.1.0-alpha.1 AS computerd
+FROM ghcr.io/cloudflare/computer-computerd-linux-x64:0.4.1 AS computerd
 
 FROM debian:stable-slim
 
@@ -87,32 +90,38 @@ To build the binary from source instead, run `npm run build:bin
 `artifacts/computerd/computerd-linux-x64`, then `COPY` that into the
 image.
 
-`computerd`'s own default port is `45678`; the Cloudflare container backend pins the in-image listener to `8080`, which is what `examples/container/` uses. See [07. Injected Service](./07_injected_service.md) for the env vars (`PORT`, `MOUNT_POINT`, `FUSE_MOUNT`, `UPSTREAM_URL`, `EXEC_LOG_MAX_BYTES`) and the reverse-dial boot sequence.
+`computerd`'s own default port is `45678`; the Cloudflare container backend pins the in-image listener to `8080`, which is what [`examples/container`](../examples/container) uses. See [07. Injected Service](./07_injected_service.md) for the env vars (`PORT`, `MOUNT_POINT`, `FUSE_MOUNT`, `EXEC_LOG_MAX_BYTES`) and the reverse-dial boot sequence.
 
 ## Example
 
 ```ts
 import { Workspace } from "@cloudflare/computer";
 import {
-  CloudflareContainerBackend,
+  ContainerBackend,
   withWorkspaceContainer,
 } from "@cloudflare/computer/backends/container";
 import { DurableObject } from "cloudflare:workers";
 
 export class Agent extends withWorkspaceContainer(class extends DurableObject<Env> {}) {
+  readonly backend = new ContainerBackend({
+    container: () => this,
+    workspace: { binding: "Agent", id: this.ctx.id.toString() },
+    name: "app",
+    instance: "standard-2",
+  });
+
   readonly workspace = new Workspace({
-    storage: this.ctx.storage, // DO storage → VFS lives here
-    backends: [
-      new CloudflareContainerBackend({
-        container: () => this,
-        workspace: { binding: "Agent", id: this.ctx.id.toString() },
-      }),
-    ],
+    storage: this.ctx.storage, // Durable Object storage → VFS lives here
+    backends: [this.backend],
   });
 
   async initialize() {
     await this.workspace.ready();
     await this.workspace.fs.mkdir("/workspace", { recursive: true });
+  }
+
+  override fetch(request: Request): Promise<Response> {
+    return this.backend.handleFetch(request);
   }
 }
 ```
@@ -238,7 +247,7 @@ above, then dive into the area you're working on.
 | [12. Worker backend](./12_worker_backend.md) | Running the shell as just-bash inside a Dynamic Worker loaded through `env.LOADER`. |
 | [13. Git interface](./13_git_interface.md) | `workspace.git` and the `git` CLI inside the shell, backed by isomorphic-git. |
 | [14. Assets interface](./14_assets_interface.md) | `share` a workspace file to R2 and get back a presigned URL. |
-| [15. Artifacts interface](./15_artifacts_interface.md) | `createArtifact` and the `artifacts` CLI, a session-scoped facade over the Cloudflare Artifacts binding. |
+| [15. Artifacts interface](./15_artifacts_interface.md) | `createArtifact` and the `artifacts` CLI, an optionally session-scoped wrapper over the Cloudflare Artifacts binding. |
 | [16. Execution runtime architecture](./16_code_execution.md) | One runtime entry point over command and module backends. |
 | [17. Isolate JavaScript runtime](./17_isolate_javascript.md) | ECMAScript modules, durable imports, configured libraries, durable `node:fs/promises`, trusted `ws:git` / `ws:artifacts`, and managed lifecycle. |
 | [18. Runtime migration](./18_runtime_migration.md) | Breaking preview-API mappings from public shell and script-execution surfaces to `workspace.runtime`. |

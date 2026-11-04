@@ -69,6 +69,7 @@ export class WorkspaceRuntime {
       env: options.env,
       stdin: options.stdin,
       timeoutMs: options.timeoutMs,
+      sync: options.sync,
     });
     return wrapModuleHandle(
       runtime,
@@ -78,6 +79,7 @@ export class WorkspaceRuntime {
       options.encoding,
       true,
       envelope.sync,
+      envelope.runtimeId,
     );
   }
 
@@ -106,6 +108,7 @@ export class WorkspaceRuntime {
       options.encoding,
       options.resume === undefined || options.resume === "full",
       envelope.sync,
+      envelope.runtimeId,
     );
   }
 
@@ -140,6 +143,7 @@ function wrapModuleHandle<E extends ExecEncoding>(
   encoding: E | undefined,
   resultMayUseSource = true,
   sync?: ModuleExecutionEnvelope["sync"],
+  runtimeId?: string,
 ): WorkspaceRuntimeExecHandle<E> {
   let claimed: "result" | "stream" | undefined;
   let sourceCancelled = false;
@@ -201,14 +205,15 @@ function wrapModuleHandle<E extends ExecEncoding>(
             return drainModuleResult<E>(source, encoding, setReader, sync);
           }
           if (!sourceCancelled) await source.cancel("result() requested a full replay");
-          const replay = await runtime.getExec({ id });
+          const replay = await runtime.getExec({ id, runtimeId });
           return drainModuleResult<E>(replay.events, encoding, setReader, replay.sync);
         })();
         return resultPromise;
       },
     },
     kill: {
-      value: (signal?: WorkspaceRuntimeKillOptions["signal"]) => runtime.killExec({ id, signal }),
+      value: (signal?: WorkspaceRuntimeKillOptions["signal"]) =>
+        runtime.killExec({ id, signal, runtimeId }),
     },
     [Symbol.dispose]: {
       value: () => {

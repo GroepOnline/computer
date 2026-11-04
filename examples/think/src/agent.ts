@@ -15,8 +15,8 @@
  *     store, agentic loop, and chat protocol.
  *   - We own a `@cloudflare/computer.Workspace` with two backends:
  *     a WorkerShellBackend (`"shell"`) for fast just-bash text tooling and
- *     a CloudflareContainerBackend (`"container"`) for full Linux
- *     userland through computerd. This mirrors examples/container while
+ *     a LegacyContainerBackend (`"container"`) for full Linux
+ *     userland through computerd. This mirrors examples/container-legacy while
  *     keeping the chat surface unchanged.
  *   - `useThink: true` adds the string-based compatibility surface
  *     Think expects; the cast promotes it from optional to present.
@@ -33,9 +33,9 @@ import {
   type WorkspaceStub,
 } from "@cloudflare/computer";
 import {
-  CloudflareContainerBackend,
-  withWorkspaceContainer,
-} from "@cloudflare/computer/backends/container";
+  LegacyContainerBackend,
+  withLegacyWorkspaceContainer,
+} from "@cloudflare/computer/backends/container-legacy";
 import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 import { createAITools } from "@cloudflare/computer/tools";
 import { Think } from "@cloudflare/think";
@@ -46,7 +46,7 @@ import { createWorkersAI } from "workers-ai-provider";
 // WorkerShellBackend reaches WorkspaceServiceProxy through
 // `ctx.exports.WorkspaceServiceProxy(...)` so the in-isolate shell
 // can call back into the host workspace. WorkspaceProxy carries the
-// container's outbound /ws egress back to this DO.
+// container's outbound /api egress back to this DO.
 export { WorkspaceProxy, WorkspaceServiceProxy };
 
 const MODEL_ID = "@cf/zai-org/glm-5.2";
@@ -58,11 +58,11 @@ function workspaceRef(ctx: DurableObjectState) {
   return { binding: "Assistant", id: ctx.id.toString() };
 }
 
-// Anchor Think's generic before the mixin so withWorkspaceContainer
+// Anchor Think's generic before the mixin so withLegacyWorkspaceContainer
 // sees a concrete constructor.
 class AssistantBase extends Think<Env> {}
 
-export class Assistant extends withWorkspaceContainer(AssistantBase) {
+export class Assistant extends withLegacyWorkspaceContainer(AssistantBase) {
   /** We have a dedicated `exec` tool; skip Think's built-in bash. */
   override workspaceBash = false;
 
@@ -72,14 +72,15 @@ export class Assistant extends withWorkspaceContainer(AssistantBase) {
   /**
    * Container backend used when `exec` needs a real Linux userland.
    * The DO itself owns the container binding through the
-   * withWorkspaceContainer mixin; CloudflareContainerBackend handles
-   * startup, outbound egress interception, the /ws upgrade, and the
+   * withLegacyWorkspaceContainer mixin; LegacyContainerBackend handles
+   * startup, outbound egress interception, the /api upgrade, and the
    * capnweb session.
    */
-  readonly #containerBackend = new CloudflareContainerBackend({
+  readonly #containerBackend = new LegacyContainerBackend({
     id: "container",
     container: () => this,
     workspace: workspaceRef(this.ctx),
+    egress: { mode: "direct" },
   });
 
   /**
@@ -102,10 +103,10 @@ export class Assistant extends withWorkspaceContainer(AssistantBase) {
     useThink: true,
   }) as Workspace & ThinkWorkspaceCompatibility;
 
-  /** Forwarded by WorkspaceProxy for computerd's outbound /ws upgrade. */
+  /** Forwarded by WorkspaceProxy for computerd's outbound /api upgrade. */
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/ws") {
+    if (url.pathname === "/api") {
       return this.#containerBackend.handleFetch(request);
     }
     return super.fetch(request);

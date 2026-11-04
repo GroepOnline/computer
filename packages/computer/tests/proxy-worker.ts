@@ -5,7 +5,7 @@
 //   - WorkspaceProxy — the class under test, re-exported so the
 //     runtime can wrap it into a loopback WorkerEntrypoint that
 //     ctx.exports can call.
-//   - TestStorageDO — a Durable Object whose fetch() answers /ws
+//   - TestStorageDO — a Durable Object whose fetch() answers /api
 //     with a stable marker so the test can verify routing landed.
 //   - TestDriver (default export) — a tiny WorkerEntrypoint whose
 //     fetch() reads `x-test-binding` and `x-test-id` from the
@@ -25,11 +25,30 @@ export interface Env {
 export class TestStorageDO extends DurableObject<Env> {
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/ws") {
+    const egressToken = request.headers.get("x-workspace-egress-token");
+    if (url.pathname === "/api" && egressToken !== null) {
+      return Response.json({
+        callbackUrl: request.url,
+        originalUrl: request.headers.get("x-workspace-egress-url"),
+        egressToken,
+        method: request.method,
+        body: await request.text(),
+      });
+    }
+    if (url.pathname === "/api") {
       return new Response(
         url.searchParams.has("token") ? `from-do:${url.searchParams.get("token")}` : "from-do",
         { status: 200 },
       );
+    }
+    if (egressToken !== null) {
+      return Response.json({
+        callbackUrl: request.url,
+        originalUrl: request.headers.get("x-workspace-egress-url"),
+        egressToken,
+        method: request.method,
+        body: await request.text(),
+      });
     }
     return new Response("DO unknown path", { status: 404 });
   }
@@ -39,8 +58,11 @@ export default class TestDriver extends WorkerEntrypoint<Env> {
   override async fetch(request: Request): Promise<Response> {
     const binding = request.headers.get("x-test-binding") ?? "COMPUTERD";
     const id = request.headers.get("x-test-id") ?? "";
+    const egressToken = request.headers.get("x-test-egress-token") ?? undefined;
     // biome-ignore lint/suspicious/noExplicitAny: ctx.exports isn't in @cloudflare/workers-types yet
-    const proxy = (this.ctx as any).exports.WorkspaceProxy({ props: { binding, id } });
+    const proxy = (this.ctx as any).exports.WorkspaceProxy({
+      props: { binding, id, egressToken },
+    });
     return proxy.fetch(request);
   }
 }

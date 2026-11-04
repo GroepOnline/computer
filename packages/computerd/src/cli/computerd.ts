@@ -1,29 +1,31 @@
 #!/usr/bin/env node
 
+import { timingSafeEqual } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { isAbsolute } from "node:path";
 import type { ExecEvent as RpcExecEvent } from "@cloudflare/computer-rpc";
-import { createWorkspaceClient, type WorkspaceClient } from "@cloudflare/computer-rpc/client";
 import { isStubTrackingEnabled, stubSnapshot } from "@cloudflare/computer-rpc/debug";
 import type { RunnerLike } from "@cloudflare/computer-rpc/server";
-import {
-  acceptWebSocketSession,
-  createWorkspaceServer,
-  serveHTTPBatch,
-} from "@cloudflare/computer-rpc/server";
+import { acceptWebSocketSession, createWorkspaceServer } from "@cloudflare/computer-rpc/server";
 import type { Database } from "@cloudflare/dofs";
 import { WebSocket, WebSocketServer } from "ws";
 import { Runner } from "../exec/index.js";
 import type { ExecEvent as ComputerdExecEvent } from "../exec/types.js";
 import {
   createNodeVirtualFileSystem,
+  describeMountIgnore,
   type FUSEBackend,
   type FuseMount,
+  type MountIgnoreInfo,
   mountFuse,
   parseFuseMountMode,
+  parseStoreMode,
+  type ResolvedStore,
   resolveFuseBackend,
+  resolveMountIgnoreConfig,
+  resolveStore,
 } from "../fuse/index.js";
 import { mountShim, type ShimMount } from "../shim/index.js";
 import { installLogging } from "./logger.js";
@@ -104,6 +106,34 @@ function requestPath(request: IncomingMessage): string {
   return url.pathname;
 }
 
+// Routes reachable without the shared secret. Readiness has to stay
+// open: the host polls it before it holds any session, and a gated
+// probe turns a bad token into what looks like a container that never
+// started.
+const UNAUTHENTICATED_PATHS = new Set(["/health"]);
+
+// When RPC_CLIENT_SECRET is set, every other route requires it as a
+// bearer token. When it is unset there is nothing to check and the
+// surface is open, which is how the harnesses and local runs work.
+function isAuthorized(request: IncomingMessage, secret: string | undefined): boolean {
+  if (secret === undefined) return true;
+  const header = request.headers.authorization;
+  if (typeof header !== "string") return false;
+  // The scheme token is case-insensitive and may be followed by more
+  // than one space, so "bearer <secret>" from a hand-written client is
+  // as valid as "Bearer <secret>". Only the credentials that follow are
+  // compared byte for byte.
+  const separator = header.indexOf(" ");
+  if (separator === -1) return false;
+  if (header.slice(0, separator).toLowerCase() !== "bearer") return false;
+  const presented = Buffer.from(header.slice(separator + 1).trim());
+  const expected = Buffer.from(secret);
+  // timingSafeEqual throws on a length mismatch, and the length of the
+  // secret is not worth leaking through the comparison either.
+  if (presented.length !== expected.length) return false;
+  return timingSafeEqual(presented, expected);
+}
+
 // Strip heartbeat events from a Runner stream before it reaches the
 // RPC layer. Heartbeats are a local observability signal only; the
 // computer-rpc wire contract carries only stdout, stderr, and exit.
@@ -123,6 +153,8 @@ interface ComputerdInfo {
   backend: FUSEBackend;
   mountPoint: string;
   port: number;
+  store: ResolvedStore;
+  ignore: MountIgnoreInfo;
 }
 
 // Snapshot DOFS table sizes and process memory so an external caller
@@ -167,7 +199,9 @@ interface HTTPHandle {
 function createHTTPServer(
   info: ComputerdInfo,
   rpc: ReturnType<typeof createWorkspaceServer>,
+  secret: string | undefined,
   getStats?: () => Record<string, unknown>,
+  checkpoint?: () => { walFrames: number; sizeBytes: number; durationMs: number },
 ): HTTPHandle {
   // Holds the current outbound capnweb session opened via /connect.
   // Re-POSTing /connect (e.g. after a DO hibernate + new incarnation)
@@ -177,34 +211,33 @@ function createHTTPServer(
   const server = createServer((request, response) => {
     const path = requestPath(request);
 
-    // /api — capnweb HTTP-batch endpoint. Single POST per call;
-    // request body carries the serialized message, response body
-    // carries the reply. Useful for environments that can't open
-    // a WebSocket (curl, fetch from a Worker without ws upgrade).
-    if (path === "/api") {
-      if (request.method !== "POST") {
-        send(response, 405, "method not allowed\n", {
-          allow: "POST",
-          "content-type": "text/plain; charset=utf-8",
-        });
-        return;
-      }
-      void serveHTTPBatch(request, response, rpc).catch((error) => {
-        console.error("/api batch failed:", error);
-        if (!response.headersSent) {
-          send(response, 500, "internal error\n", {
-            "content-type": "text/plain; charset=utf-8",
-          });
-        }
+    // Checked before routing so an unauthorized caller cannot learn
+    // which routes exist.
+    if (!UNAUTHENTICATED_PATHS.has(path) && !isAuthorized(request, secret)) {
+      send(response, 401, "unauthorized\n", {
+        "www-authenticate": "Bearer",
+        "content-type": "text/plain; charset=utf-8",
       });
       return;
     }
 
-    // /connect — POST { url } where url is the http(s) base of an
-    // egress endpoint the host wants us to dial back into. We open a
-    // capnweb WebSocket session against `${url}/ws` and serve our RPC
-    // over it, exactly like /ws but with the carrier inverted (we
-    // dial out instead of accepting an inbound upgrade).
+    // /api — the capnweb endpoint. It carries one transport, a
+    // websocket, so a request that reaches the ordinary handler here
+    // has no Upgrade header and cannot be served. Say so plainly:
+    // the alternative is a caller that connects, makes one call that
+    // appears to work, and then fails on a stream.
+    if (path === "/api") {
+      send(response, 400, "/api requires a websocket upgrade\n", {
+        "content-type": "text/plain; charset=utf-8",
+      });
+      return;
+    }
+
+    // /connect — POST { base, health, api } naming an endpoint the
+    // host wants us to dial back into. We poll `base + health` until
+    // it answers, then open a capnweb WebSocket session against
+    // `base + api` and serve our RPC over it: the same session as an
+    // inbound upgrade, with the carrier inverted because we dial out.
     if (path === "/connect") {
       if (request.method !== "POST") {
         send(response, 405, "method not allowed\n", {
@@ -213,7 +246,38 @@ function createHTTPServer(
         });
         return;
       }
-      void handleConnect(request, response, rpc, upstreamSlot);
+      void handleConnect(request, response, rpc, upstreamSlot, secret);
+      return;
+    }
+
+    // /__computerd/checkpoint — fold the write-ahead log back into
+    // the main database file. A host about to ask the platform for a
+    // disk snapshot calls this first so the snapshot captures one
+    // file rather than a file plus a log segment.
+    if (path === "/__computerd/checkpoint") {
+      if (request.method !== "POST") {
+        send(response, 405, "method not allowed\n", {
+          allow: "POST",
+          "content-type": "text/plain; charset=utf-8",
+        });
+        return;
+      }
+      if (checkpoint === undefined) {
+        send(response, 404, "checkpoint unavailable\n", {
+          "content-type": "text/plain; charset=utf-8",
+        });
+        return;
+      }
+      try {
+        send(response, 200, JSON.stringify(checkpoint()), {
+          "content-type": "application/json; charset=utf-8",
+        });
+      } catch (error) {
+        console.error("/__computerd/checkpoint failed:", error);
+        send(response, 500, "internal error\n", {
+          "content-type": "text/plain; charset=utf-8",
+        });
+      }
       return;
     }
 
@@ -222,6 +286,39 @@ function createHTTPServer(
         allow: "GET, HEAD",
         "content-type": "text/plain; charset=utf-8",
       });
+      return;
+    }
+
+    // /api/watermarks — the same sync revisions the session serves,
+    // over plain HTTP, for samplers that want a few numbers on an
+    // interval rather than a session of their own. It reads through
+    // rpc.sync.watermarks(), so the two cannot drift. Part of the
+    // workspace API rather than daemon introspection, hence /api
+    // rather than /__computerd.
+    //
+    // It has to sit below the method guard above: reads only, and the
+    // guard is what enforces that for every read route. Above it, this
+    // answered a POST or a DELETE with the numbers.
+    if (path === "/api/watermarks") {
+      if (request.method === "HEAD") {
+        send(response, 200, "", { "content-type": "application/json; charset=utf-8" });
+        return;
+      }
+      void rpc.sync
+        .watermarks()
+        .then((watermarks) => {
+          send(response, 200, JSON.stringify(watermarks), {
+            "content-type": "application/json; charset=utf-8",
+          });
+        })
+        .catch((error: unknown) => {
+          console.error("/api/watermarks failed:", error);
+          if (!response.headersSent) {
+            send(response, 500, "internal error\n", {
+              "content-type": "text/plain; charset=utf-8",
+            });
+          }
+        });
       return;
     }
 
@@ -277,21 +374,51 @@ function createHTTPServer(
     });
   });
 
-  // /ws — capnweb WebSocket endpoint. Long-lived, bidirectional,
-  // streaming-friendly. The container's primary sync carrier.
-  // perMessageDeflate compresses each WS frame with zlib. Defaults
-  // off in the `ws` package; we turn it on so computerd-to-computerd peers
-  // (and any Node-side client that negotiates the extension) save
-  // bytes on the wire. Clients that don't advertise the extension
-  // negotiate down to plain frames, so no flag day for workerd or
-  // browser callers.
+  // /api — the capnweb endpoint. Long-lived, bidirectional, and
+  // streaming-friendly, which is what the wire contract needs: every
+  // call that reads data back returns a ReadableStream.
+  // perMessageDeflate compresses each frame with zlib. Defaults off
+  // in the `ws` package; we turn it on so any Node-side client that
+  // negotiates the extension saves bytes on the wire. Clients that
+  // don't advertise it negotiate down to plain frames, so no flag day
+  // for workerd or browser callers.
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: true });
   wss.on("connection", (ws) => {
     acceptWebSocketSession(ws, rpc);
   });
   server.on("upgrade", (request, socket, head) => {
-    if (requestPath(request) !== "/ws") {
+    if (!isAuthorized(request, secret)) {
+      socket.write(
+        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nConnection: close\r\n\r\n",
+      );
+      socket.destroy();
+      return;
+    }
+    if (requestPath(request) !== "/api") {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    // `ws` answers a malformed handshake for us: 405 for a method
+    // other than GET, 400 for a bad Upgrade header or a missing key.
+    // It answers 400 for an unsupported version too, where the
+    // websocket specification calls for 426, so that one case is
+    // handled here before handing over.
+    //
+    // Only a header naming a single version we do not speak earns 426.
+    // Absent, repeated (node joins the values into "13, 13"), or not a
+    // whole number are all malformed handshakes rather than version
+    // mismatches, and answering those with 426 points the caller at
+    // something that was never the problem. They fall through to `ws`,
+    // which answers 400 and still reports the versions we do speak.
+    const versionHeader = request.headers["sec-websocket-version"];
+    const version = typeof versionHeader === "string" ? Number(versionHeader.trim()) : Number.NaN;
+    if (Number.isInteger(version) && version !== 13 && version !== 8) {
+      socket.write(
+        "HTTP/1.1 426 Upgrade Required\r\n" +
+          "Sec-WebSocket-Version: 13, 8\r\n" +
+          "Connection: close\r\n\r\n",
+      );
       socket.destroy();
       return;
     }
@@ -322,14 +449,35 @@ async function closeServer(server: Server): Promise<void> {
   });
 }
 
+// The caller names every part of the endpoint it wants us to reach.
+// We assemble `base + health` and `base + api` and hold no opinion
+// about either path, so the host is free to rename its own routes
+// without a matching release of this binary.
 interface ConnectBody {
-  // Base URL of the egress endpoint. ws[s]:// or http[s]://; we
-  // normalise http(s) to ws(s) and append /ws.
-  url?: unknown;
-  // How long to poll the upstream /health before giving up.
-  // Defaults to 30s; the egress proxy is up at boot but the worker
-  // that hosts it may take a tick.
+  // http:// or https:// origin of the endpoint, optionally with a
+  // path prefix. Trailing slashes are trimmed.
+  base?: unknown;
+  // Absolute path of the readiness probe, e.g. "/health".
+  health?: unknown;
+  // Absolute path of the capnweb endpoint, e.g. "/api". Dialed as
+  // ws:// or wss:// according to the scheme on `base`.
+  api?: unknown;
+  // How long to poll the readiness probe before giving up. Defaults
+  // to 30s; the egress proxy is up at boot but the worker that hosts
+  // it may take a tick.
   healthTimeoutMs?: unknown;
+}
+
+// A path we're willing to append to `base`. Rejecting anything that
+// parses as an address of its own keeps a caller from redirecting the
+// dial somewhere the base never pointed. "//host/path" is
+// protocol-relative, which resolves against the base's scheme rather
+// than staying under the base, so it goes too.
+function isEndpointPath(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  if (!value.startsWith("/")) return false;
+  if (value.startsWith("//")) return false;
+  return !URL.canParse(value);
 }
 
 async function handleConnect(
@@ -337,6 +485,7 @@ async function handleConnect(
   response: ServerResponse,
   rpc: ReturnType<typeof createWorkspaceServer>,
   upstreamSlot: { ws: WebSocket | undefined },
+  secret: string | undefined,
 ): Promise<void> {
   let body: ConnectBody;
   try {
@@ -348,22 +497,38 @@ async function handleConnect(
     return;
   }
 
-  if (typeof body.url !== "string" || body.url.length === 0) {
-    send(response, 400, "missing 'url' in body\n", {
+  if (
+    typeof body.base !== "string" ||
+    !(body.base.startsWith("http://") || body.base.startsWith("https://"))
+  ) {
+    send(response, 400, "'base' must be an http:// or https:// URL\n", {
       "content-type": "text/plain; charset=utf-8",
     });
     return;
   }
-  const baseUrl = body.url.replace(/\/+$/, "");
+  if (!isEndpointPath(body.health)) {
+    send(response, 400, "'health' must be an absolute path such as /health\n", {
+      "content-type": "text/plain; charset=utf-8",
+    });
+    return;
+  }
+  if (!isEndpointPath(body.api)) {
+    send(response, 400, "'api' must be an absolute path such as /api\n", {
+      "content-type": "text/plain; charset=utf-8",
+    });
+    return;
+  }
+  const baseUrl = body.base.replace(/\/+$/, "");
+  const healthUrl = `${baseUrl}${body.health}`;
   const healthTimeoutMs =
     typeof body.healthTimeoutMs === "number" && body.healthTimeoutMs > 0
       ? body.healthTimeoutMs
       : 30_000;
 
   try {
-    await waitForHealth(baseUrl, healthTimeoutMs);
+    await waitForHealth(healthUrl, healthTimeoutMs);
   } catch (error) {
-    send(response, 502, `upstream /health unreachable: ${(error as Error).message}\n`, {
+    send(response, 502, `readiness probe unreachable: ${(error as Error).message}\n`, {
       "content-type": "text/plain; charset=utf-8",
     });
     return;
@@ -383,8 +548,15 @@ async function handleConnect(
     }
   }
 
-  const wsUrl = `${toWebSocketUrl(baseUrl)}/ws`;
-  const ws = new WebSocket(wsUrl);
+  const wsUrl = `${toWebSocketUrl(baseUrl)}${body.api}`;
+  // Present the shared secret on the way out as well. The host arms a
+  // slot for this upgrade and hands the first arrival its session, so
+  // without a token anything that can reach the host's endpoint — which
+  // includes every command this daemon runs — could take the workspace's
+  // place. The host holds the same secret, having set it at launch.
+  const ws = new WebSocket(wsUrl, {
+    ...(secret !== undefined ? { headers: { authorization: `Bearer ${secret}` } } : {}),
+  });
   upstreamSlot.ws = ws;
   ws.once("open", () => {
     console.log(`/connect: attached RPC session to ${wsUrl}`);
@@ -414,15 +586,13 @@ async function readJson<T>(request: IncomingMessage): Promise<T> {
 }
 
 function toWebSocketUrl(input: string): string {
-  if (input.startsWith("ws://") || input.startsWith("wss://")) return input;
   if (input.startsWith("http://")) return `ws://${input.slice("http://".length)}`;
   if (input.startsWith("https://")) return `wss://${input.slice("https://".length)}`;
   throw new Error(`unsupported URL scheme: ${input}`);
 }
 
-async function waitForHealth(baseUrl: string, timeoutMs: number): Promise<void> {
+async function waitForHealth(healthUrl: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  const healthUrl = `${toHttpUrl(baseUrl)}/health`;
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
@@ -439,12 +609,6 @@ async function waitForHealth(baseUrl: string, timeoutMs: number): Promise<void> 
   );
 }
 
-function toHttpUrl(input: string): string {
-  if (input.startsWith("ws://")) return `http://${input.slice("ws://".length)}`;
-  if (input.startsWith("wss://")) return `https://${input.slice("wss://".length)}`;
-  return input;
-}
-
 async function main(): Promise<void> {
   // Install logging + crash handlers first thing so any early throws
   // (parsePort, parseMountPoint, resolveFuseBackend) still land in
@@ -453,33 +617,78 @@ async function main(): Promise<void> {
 
   rejectLegacyFuseEnv(process.env);
 
+  // Read the shared secret once and drop it from the environment. The
+  // exec allowlist already keeps it out of spawned commands; removing
+  // it here means a future code path that spreads process.env cannot
+  // reintroduce the leak.
+  const clientSecret = process.env.RPC_CLIENT_SECRET?.trim() || undefined;
+  delete process.env.RPC_CLIENT_SECRET;
+
   const port = parsePort(process.env.PORT);
   const mountPoint = parseMountPoint(process.env.MOUNT_POINT);
   // FUSE_MOUNT picks the backend. auto (default) probes /dev/fuse
   // or macFUSE and falls back to the userspace shim. fuse / macfuse
   // require their respective real backend. shim forces the userspace
-  // polling shim. none skips the mount entirely; HTTP + /api + /ws
+  // polling shim. none skips the mount entirely; HTTP and /api
   // still come up so tests and tooling can talk to computerd's RPC surface.
   const fuseMountMode = parseFuseMountMode(process.env.FUSE_MOUNT);
   const backend: FUSEBackend = await resolveFuseBackend(fuseMountMode);
   console.log(`[info] FUSE_MOUNT=${fuseMountMode} resolved to backend=${backend.kind}`);
 
-  const upstreamUrl = process.env.UPSTREAM_URL?.trim();
-  let upstreamClient: WorkspaceClient | undefined;
-  if (upstreamUrl !== undefined && upstreamUrl.length > 0) {
-    // Use the `ws` package's WebSocket (not Node's built-in
-    // global) so the dial negotiates permessage-deflate against
-    // the upstream's WebSocketServer. Node 22's built-in
-    // WebSocket doesn't advertise the deflate extension.
-    upstreamClient = createWorkspaceClient({
-      url: upstreamUrl,
-      WebSocketImpl: WebSocket as unknown as typeof globalThis.WebSocket,
-    });
+  // Local-only paths (#179). Resolved before the store so a
+  // misconfiguration fails the daemon at startup rather than after the
+  // mount is live: a silently dropped entry would send a full
+  // node_modules into the Durable Object, which is the failure this
+  // feature exists to prevent.
+  const ignoreConfig = resolveMountIgnoreConfig(process.env, mountPoint);
+  // The shim copies everything under the mount into the VFS, so it has
+  // no way to keep a path local. Starting anyway would report the paths
+  // as local-only on /__computerd/info while syncing them, and the
+  // host's check would pass. FUSE_MOUNT=auto lands here too when
+  // /dev/fuse is missing, which is exactly when this needs to be loud.
+  if (ignoreConfig.enabled && backend.kind === "shim") {
+    throw new Error(
+      `MOUNT_IGNORE is not supported on the userspace shim (FUSE_MOUNT=${fuseMountMode} ` +
+        `resolved to backend=shim). Run with real FUSE, or unset MOUNT_IGNORE.`,
+    );
   }
-  const { vfs, db, stopSync } = await createNodeVirtualFileSystem({
-    upstream: upstreamClient?.sync,
-  });
-  const info: ComputerdInfo = { backend, mountPoint, port };
+  if (ignoreConfig.enabled) {
+    console.log(
+      `[info] MOUNT_IGNORE active: local-only under ${ignoreConfig.root} ` +
+        `(${ignoreConfig.ignore.patterns.join(", ")})`,
+    );
+    for (const exclusion of ignoreConfig.ignore.ineffectiveExclusions) {
+      // Same rule as git: a path can't be put back in sync once a
+      // directory above it is local-only, because the synced side has no
+      // directory for it to live in.
+      console.log(
+        `[warn] MOUNT_IGNORE exclusion ${exclusion} has no effect: a directory ` +
+          `above it is already local-only.`,
+      );
+    }
+  }
+
+  const store = resolveStore(parseStoreMode(process.env.COMPUTERD_DB), mountPoint);
+  console.log(
+    `[info] COMPUTERD_DB resolved to store=${store.kind}${
+      store.kind === "file" ? ` path=${store.path} fresh=${store.fresh}` : ""
+    }`,
+  );
+
+  const {
+    vfs,
+    db,
+    checkpoint: checkpointStore,
+    storeStats,
+    close: closeStore,
+  } = await createNodeVirtualFileSystem({ store });
+  const info: ComputerdInfo = {
+    backend,
+    mountPoint,
+    port,
+    store,
+    ignore: describeMountIgnore(ignoreConfig),
+  };
 
   let fuse: FuseMount | undefined;
   // When running on the userspace shim, capture the typed handle
@@ -499,10 +708,26 @@ async function main(): Promise<void> {
       shim = await mountShim({ vfs, mountPoint });
       fuse = shim;
     } else {
+      // The local-only store is created eagerly so a permission or
+      // read-only-filesystem problem surfaces at mount time, next to
+      // the configuration that caused it, rather than on the first
+      // write into an ignored path mid-command.
+      if (ignoreConfig.enabled) {
+        await mkdir(ignoreConfig.root, { recursive: true });
+      }
       fuse = await mountFuse({
         backend,
         mountPoint,
         vfs,
+        ...(ignoreConfig.enabled
+          ? {
+              localPaths: {
+                root: ignoreConfig.root,
+                ignore: ignoreConfig.ignore,
+                mountPoint,
+              },
+            }
+          : {}),
       });
     }
   }
@@ -519,12 +744,23 @@ async function main(): Promise<void> {
     }
     logMaxBytesOverride = parsed;
   }
+  // EXEC_SHELL picks the interpreter exec runs commands under, for images
+  // whose /bin/sh cannot be repointed. Default lives in the Runner.
+  const shellEnv = process.env.EXEC_SHELL;
+  let shellOverride: string | undefined;
+  if (shellEnv !== undefined && shellEnv !== "") {
+    if (!shellEnv.startsWith("/")) {
+      throw new Error(`EXEC_SHELL must be an absolute path; got ${JSON.stringify(shellEnv)}`);
+    }
+    shellOverride = shellEnv;
+  }
   const runner = new Runner({
     db,
     // When we have a mount (real FUSE or the shim) point spawned
     // children at it so writes from exec flow through the VFS.
     ...(fuse !== undefined ? { cwd: mountPoint } : {}),
     ...(logMaxBytesOverride !== undefined ? { logMaxBytes: logMaxBytesOverride } : {}),
+    ...(shellOverride !== undefined ? { shell: shellOverride } : {}),
   });
   // Heartbeat events are computerd-local and must not cross the RPC boundary.
   // Wrap the runner so every exec/get stream drops heartbeat events before
@@ -560,10 +796,22 @@ async function main(): Promise<void> {
         }
       : {}),
   });
-  const http = createHTTPServer(info, rpc, () => ({
-    ...collectDbStats(db),
-    ...(fuse?.getBufferStats?.() ?? {}),
-  }));
+  const http = createHTTPServer(
+    info,
+    rpc,
+    clientSecret,
+    () => {
+      const { sizeBytes, freelistCount } = storeStats();
+      return {
+        ...collectDbStats(db),
+        ...(fuse?.getBufferStats?.() ?? {}),
+        ...(fuse?.getLocalPathStats === undefined ? {} : { localPaths: fuse.getLocalPathStats() }),
+        store_size_bytes: sizeBytes,
+        store_freelist_count: freelistCount,
+      };
+    },
+    checkpointStore,
+  );
 
   let shuttingDown = false;
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
@@ -584,13 +832,13 @@ async function main(): Promise<void> {
     if (fuse !== undefined) {
       await unmount(fuse);
     }
-    if (upstreamClient !== undefined) {
-      try {
-        stopSync();
-        await upstreamClient.close();
-      } catch (error) {
-        console.error(error);
-      }
+    // Unmount first. The FUSE driver writes any buffered bytes to the
+    // database when it releases a file, and those writes need to land
+    // before the store closes.
+    try {
+      closeStore();
+    } catch (error) {
+      console.error("failed to close the store:", error);
     }
     teardownLogging();
     process.exit(signal === "SIGINT" ? 130 : 143);

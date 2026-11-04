@@ -1,3 +1,9 @@
+// Duplicated verbatim from ../container-legacy/. The two backends serve
+// different container scheduling policies, but this file touches
+// neither the launch spec nor the policy, so there is no divergence
+// pressure on it and the copy is deliberate rather than overlooked.
+// Fixes here apply to both copies.
+//
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
@@ -152,12 +158,13 @@ describe("installContainerMonitor", () => {
     expect(exit?.exitedAt).toBe(Date.now());
   });
 
-  test("records the rejection reason when the monitor rejects", async () => {
+  test("records the rejection reason and runs current-generation cleanup", async () => {
     const fake = makeContainer();
     const ctx = makeContext(fake.container);
+    const cleanup = vi.fn(async () => {});
     resetContainerLifecycleForTests(ctx);
     fake.container.start();
-    installContainerMonitor(ctx, fake.container);
+    installContainerMonitor(ctx, fake.container, cleanup);
 
     fake.current.reject(new Error("container crashed"));
     await Promise.resolve();
@@ -165,6 +172,7 @@ describe("installContainerMonitor", () => {
 
     const exit = containerExitInfo(ctx);
     expect(exit?.reason).toBe("container crashed");
+    expect(cleanup).toHaveBeenCalledOnce();
   });
 
   test("logs at warn level on an unexpected exit", async () => {
@@ -226,9 +234,10 @@ describe("installContainerMonitor", () => {
     const ctx = makeContext(fake.container);
     resetContainerLifecycleForTests(ctx);
 
+    const staleCleanup = vi.fn(async () => {});
     fake.container.start();
     const firstGeneration = fake.current;
-    installContainerMonitor(ctx, fake.container);
+    installContainerMonitor(ctx, fake.container, staleCleanup);
 
     // Second generation — a new monitor promise is armed in the
     // fake's start(); installContainerMonitor bumps the lifecycle's
@@ -245,6 +254,7 @@ describe("installContainerMonitor", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(containerExitInfo(ctx)).toBeNull();
+    expect(staleCleanup).not.toHaveBeenCalled();
 
     // The current generation's monitor still records normally.
     secondGeneration.reject(new Error("current generation died"));

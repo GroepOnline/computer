@@ -142,11 +142,93 @@ function v4_to_v5_without_rowid(db: Database): void {
   db.run(`CREATE INDEX vfs_chunks_by_hash ON vfs_chunks(hash)`);
 }
 
+function v5_to_v6_push_cursor(db: Database): void {
+  db.run(
+    `CREATE TABLE IF NOT EXISTS _vfs_push_cursor (
+       k       TEXT    NOT NULL CHECK(k = 'push'),
+       backend TEXT    NOT NULL DEFAULT 'default',
+       rev     INTEGER NOT NULL DEFAULT 0,
+       path    TEXT,
+       PRIMARY KEY (k, backend)
+     )`,
+  );
+  db.run(
+    `INSERT OR IGNORE INTO _vfs_push_cursor (k, backend, rev, path)
+       SELECT 'push', backend, v, NULL
+       FROM _vfs_watermark
+       WHERE k = 'pushRev'`,
+  );
+}
+
+// v6 → v7 — add the restartable sync operation table and its skip
+// log. Both are new tables, so the migration is a plain create; no
+// existing rows need reshaping. Fresh installs land the same DDL from
+// `sync.ts`, and both paths must keep the CHECK constraints aligned.
+//
+// Nothing is backfilled. An upgraded database has no in-flight
+// operation by definition — the old code path had nowhere to record
+// one — so the first pull or push after the upgrade captures a fresh
+// target from the existing watermark cursor.
+function v6_to_v7_sync_operations(db: Database): void {
+  db.run(
+    `CREATE TABLE IF NOT EXISTS _vfs_sync_operations (
+       backend             TEXT    NOT NULL,
+       direction           TEXT    NOT NULL CHECK (direction IN ('pull', 'push')),
+       generation          TEXT    NOT NULL,
+       status              TEXT    NOT NULL CHECK (
+                             status IN ('capturing', 'pending', 'failed', 'lost')
+                           ),
+       target_rev          INTEGER,
+       target_path         TEXT,
+       runtime_id          TEXT,
+       mode                TEXT    CHECK (mode IN ('entries', 'pack')),
+       block_after_rev     INTEGER,
+       block_after_path    TEXT,
+       block_started_at    INTEGER,
+       internal_max_entries INTEGER NOT NULL,
+       internal_max_bytes  INTEGER NOT NULL,
+       created_at          INTEGER NOT NULL,
+       updated_at          INTEGER NOT NULL,
+       last_error          TEXT,
+       PRIMARY KEY (backend, direction)
+     )`,
+  );
+  db.run(
+    `CREATE TABLE IF NOT EXISTS _vfs_sync_skips (
+       backend    TEXT    NOT NULL,
+       direction  TEXT    NOT NULL CHECK (direction IN ('pull', 'push')),
+       generation TEXT    NOT NULL,
+       path       TEXT    NOT NULL,
+       reason     TEXT    NOT NULL,
+       at         INTEGER NOT NULL,
+       PRIMARY KEY (backend, direction, generation, path)
+     )`,
+  );
+}
+
+// v7 → v8 — add `vfs_changes_by_op_rev`. The push tick's tombstone
+// query filters `rev > ? AND op = 'delete'` and groups by path;
+// without an (op, rev) index the planner scans vfs_changes in path
+// order and never applies the rev predicate, reading the whole table
+// to return the few rows inside the watermark window.
+//
+// Index-only migration: no table is rewritten and no row is touched,
+// so existing tombstones carry through untouched. The CREATE is
+// duplicated in `sync.ts`'s fresh-install DDL; keep the two in
+// lockstep. IF NOT EXISTS keeps this safe if a database somehow
+// already has the index.
+function v7_to_v8_changes_op_rev_index(db: Database): void {
+  db.run(`CREATE INDEX IF NOT EXISTS vfs_changes_by_op_rev ON vfs_changes(op, rev)`);
+}
+
 export const MIGRATIONS: readonly Migration[] = [
   { from: 1, to: 2, migrator: v1_to_v2_add_mounts_mode },
   { from: 2, to: 3, migrator: v2_to_v3_add_size_column },
   { from: 3, to: 4, migrator: v3_to_v4_watermark_backend_column },
   { from: 4, to: 5, migrator: v4_to_v5_without_rowid },
+  { from: 5, to: 6, migrator: v5_to_v6_push_cursor },
+  { from: 6, to: 7, migrator: v6_to_v7_sync_operations },
+  { from: 7, to: 8, migrator: v7_to_v8_changes_op_rev_index },
 ] as const;
 
 // Apply every migration whose `from` matches the current version,

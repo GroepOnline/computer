@@ -5,12 +5,9 @@ import {
   WorkspaceServiceProxy,
   type WorkspaceStub,
 } from "@cloudflare/computer";
-import { CloudflareContainerBackend } from "@cloudflare/computer/backends/container";
-import {
-  WorkerShellBackend,
-  type WorkerShellBackendOptions,
-} from "@cloudflare/computer/backends/worker-shell";
-import { getSandbox, type Sandbox as SandboxDO } from "@cloudflare/sandbox";
+import { LegacyContainerBackend } from "@cloudflare/computer/backends/container-legacy";
+import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
+import { getSandbox } from "@cloudflare/sandbox";
 import { type ChunkContext, type StepContext, Think } from "@cloudflare/think";
 import type { ToolSet } from "ai";
 import { getServerByName } from "partyserver";
@@ -18,12 +15,9 @@ import type { ExecutionTarget, RunEventKind, RuntimeId } from "../../shared/even
 import type { ComparisonFixture, FixtureFile } from "../../shared/fixture";
 import {
   type ContainerWarmPoolHandle,
-  type ContainerWarmPoolNamespace,
   containerSleepAfter,
   getWarmPoolHandle,
-  type WorkspaceContainerHost,
 } from "../container-pools";
-import type { CompareRun } from "../index";
 import {
   createSandboxRuntimeAdapter,
   createWorkspaceRuntimeAdapter,
@@ -48,18 +42,10 @@ import { createRuntimeThinkTools, type RuntimeThinkToolRecorder } from "./runtim
 
 export { WorkspaceProxy, WorkspaceServiceProxy };
 
-export interface RuntimeThinkAgentEnv {
-  AI: Ai;
-  CompareRun: DurableObjectNamespace<CompareRun>;
-  Sandbox: DurableObjectNamespace<SandboxDO>;
-  SandboxWarmPool: ContainerWarmPoolNamespace;
-  WorkspaceContainerHost: DurableObjectNamespace<WorkspaceContainerHost>;
-  WorkspaceWarmPool: ContainerWarmPoolNamespace;
-  CONTAINER_SLEEP_AFTER?: string;
-  FUSE_MOUNT?: string;
-  LOADER: WorkerShellBackendOptions["loader"];
-  WARM_POOL_RESET_KEY?: string;
-}
+// The agents read a subset of the Worker bindings, but the Think base
+// class constrains its env to the generated global Env, so alias that
+// rather than restating the shape here.
+export type RuntimeThinkAgentEnv = Env;
 
 interface RunConfig {
   runId: string;
@@ -250,7 +236,7 @@ export class WorkspaceThinkAgent extends RuntimeThinkAgent {
   readonly runtime = "workspace";
   readonly runtimeLabel = "Workspace";
   readonly #ctx: DurableObjectState;
-  #activeBackend: CloudflareContainerBackend | null = null;
+  #activeBackend: LegacyContainerBackend | null = null;
   #activeWorkspace: Workspace | null = null;
 
   constructor(ctx: DurableObjectState, env: RuntimeThinkAgentEnv) {
@@ -260,7 +246,7 @@ export class WorkspaceThinkAgent extends RuntimeThinkAgent {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === "/ws" && this.#activeBackend) {
+    if (url.pathname === "/api" && this.#activeBackend) {
       return this.#activeBackend.handleFetch(request);
     }
     return super.fetch(request);
@@ -310,7 +296,7 @@ export class WorkspaceThinkAgent extends RuntimeThinkAgent {
   ): WorkspaceRunSession {
     const workspaceRef = { binding: "WorkspaceThinkAgent", id: this.#ctx.id.toString() };
     let assignedContainerId: string | null = null;
-    const backend = new CloudflareContainerBackend({
+    const backend = new LegacyContainerBackend({
       id: "container",
       container: async () => {
         const containerId = await getWarmPoolHandle(this.env.WorkspaceWarmPool).getContainer(
@@ -330,6 +316,7 @@ export class WorkspaceThinkAgent extends RuntimeThinkAgent {
         );
       },
       workspace: workspaceRef,
+      egress: { mode: "direct" },
       containerEnv: this.env.FUSE_MOUNT ? { FUSE_MOUNT: this.env.FUSE_MOUNT } : undefined,
     });
     const workspace = new Workspace({
@@ -429,7 +416,7 @@ export class SandboxThinkAgent extends RuntimeThinkAgent {
 }
 
 interface WorkspaceRunSession {
-  backend: CloudflareContainerBackend;
+  backend: LegacyContainerBackend;
   workspace: Workspace;
   close(): Promise<void>;
 }

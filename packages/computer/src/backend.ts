@@ -73,6 +73,11 @@ export interface BackendHandle {
   // The composite WorkspaceRPC stub pointing at the computerd
   // backend produced.
   rpc: WorkspaceRPC;
+  // Durable identity of the runtime process behind this connection.
+  // Reconnecting to the same process preserves it; a replacement
+  // process receives a new id. Backends without process-local state
+  // may omit it.
+  runtimeId?: string;
   // Declares whether this backend pairs with an independent
   // remote store that the Workspace must sync against.
   //
@@ -85,6 +90,19 @@ export interface BackendHandle {
   //              Durable Object). push/pull are no-ops, and the
   //              reconcile-watermarks pass on connect is skipped.
   sync?: "remote" | "none";
+  // The MOUNT_IGNORE patterns this backend's container applies, as the
+  // container reports them (#179). Paths they match stay on the
+  // container's own disk. Absent on backends with no such concept.
+  //
+  // `supported: false` means the container predates patterns, so every
+  // path is synced regardless of what the host asked for. Worth
+  // logging: it is the difference between a configuration that works
+  // and one that silently does nothing.
+  ignore?: {
+    readonly patterns: readonly string[];
+    readonly root: string | undefined;
+    readonly supported: boolean;
+  };
   // Resolves when the underlying transport closes for any reason
   // (clean close, peer crash, network drop). The Workspace listens
   // for this and drops its cached handle so the next ready() call

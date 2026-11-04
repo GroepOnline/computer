@@ -1,3 +1,9 @@
+// Duplicated verbatim from ../container-legacy/. The two backends serve
+// different container scheduling policies, but this file touches
+// neither the launch spec nor the policy, so there is no divergence
+// pressure on it and the copy is deliberate rather than overlooked.
+// Fixes here apply to both copies.
+//
 // Container lifecycle helpers.
 //
 // `WorkspaceContainerAPI` is constructed fresh on every
@@ -88,7 +94,11 @@ export function formatExitReason(error: unknown): string {
 // generation". If a caller arms twice for the same generation,
 // the worst that happens is two handlers race to write the same
 // exit state — same value, same generation.
-export function installContainerMonitor(ctx: DurableObjectState, container: ContainerHandle): void {
+export function installContainerMonitor(
+  ctx: DurableObjectState,
+  container: ContainerHandle,
+  onExit?: () => void | Promise<void>,
+): void {
   const state = getContainerLifecycle(ctx);
   state.currentGeneration += 1;
   const generation = state.currentGeneration;
@@ -102,8 +112,8 @@ export function installContainerMonitor(ctx: DurableObjectState, container: Cont
   // continues. Both branches feed into recordExit which never
   // throws, so the wrapper itself resolves rather than rejecting.
   state.currentMonitorSettled = monitorPromise.then(
-    () => recordExit(state, generation, undefined),
-    (error) => recordExit(state, generation, error),
+    () => recordExit(state, generation, undefined, onExit),
+    (error) => recordExit(state, generation, error, onExit),
   );
 }
 
@@ -147,7 +157,12 @@ export function resetContainerLifecycleForTests(ctx: DurableObjectState): void {
   LIFECYCLE.delete(ctx);
 }
 
-function recordExit(state: ContainerLifecycleState, generation: number, error: unknown): void {
+async function recordExit(
+  state: ContainerLifecycleState,
+  generation: number,
+  error: unknown,
+  onExit?: () => void | Promise<void>,
+): Promise<void> {
   // Drop late writes from superseded monitors. The state object is
   // shared across generations; only the current one is allowed to
   // mutate `exit`. Log nothing on a stale exit — the operator
@@ -176,6 +191,15 @@ function recordExit(state: ContainerLifecycleState, generation: number, error: u
       reason,
       exitedAt,
       expected: false,
+    });
+  }
+  try {
+    await onExit?.();
+  } catch (cleanupError) {
+    console.error({
+      message: "workspace.container.exit_cleanup_failed",
+      reason: formatExitReason(cleanupError),
+      exitedAt: Date.now(),
     });
   }
 }

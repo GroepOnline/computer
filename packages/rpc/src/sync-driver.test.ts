@@ -345,7 +345,65 @@ describe("SyncRPC server — afterApply hook", () => {
     }
   });
 
-  it("a thrown hook does not fail the push", async () => {
+  it("a thrown hook fails the push and leaves the sender cursor behind", async () => {
+    const a = makePeer();
+    const b = makeReceiverWithSpy();
+    try {
+      const providerA = new SQLiteWorkspaceProvider(a.db, { now: () => 1 });
+      providerA.writeFileSync("/hi.txt", "hi");
+      const before = readWatermark(a.db, "pushRev");
+
+      b.setAfterApply(() => {
+        throw new Error("settle blew up");
+      });
+
+      // The caller spawns a command on the strength of this
+      // acknowledgment, so an unflushed block must not be reported as
+      // success. The entries do commit on the receiver — the failure
+      // is about disk visibility, not the log — but the sender must
+      // not retire the block.
+      await expect(pushOnce(a.db, b.rpc)).rejects.toThrow("settle blew up");
+      expect(b.calls).toBe(1);
+      expect(fileEntries(b.db)).toContain("hi.txt");
+      expect(readWatermark(a.db, "pushRev")).toBe(before);
+    } finally {
+      a.close();
+      b.close();
+    }
+  });
+
+  it("acknowledges an external push whose settle rejects", async () => {
+    const b = makeReceiverWithSpy();
+    try {
+      // An external writer (senderRev 0) has no durable cursor to
+      // rewind, and its entries skip the stale-tombstone guard because
+      // they apply as local writes. Reporting a failure would invite a
+      // retry of a delete that could remove a newer recreation, so the
+      // settle failure is swallowed for this caller only.
+      const provider = new SQLiteWorkspaceProvider(b.db, { now: () => 1 });
+      provider.writeFileSync("/gone.txt", "x");
+
+      b.setAfterApply(() => {
+        throw new Error("settle blew up");
+      });
+
+      const changes = new ReadableStream<ChangeEntry>({
+        start(controller) {
+          controller.enqueue({ kind: "delete", rev: 1, path: "/gone.txt" });
+          controller.close();
+        },
+      });
+      const ack = await b.rpc.push({ senderRev: 0, changes });
+      expect(b.calls).toBe(1);
+      // Acknowledged despite the failed settle, and the delete stands.
+      expect(ack.appliedPushCursor).toEqual({ rev: 0, path: null });
+      expect(fileEntries(b.db)).not.toContain("gone.txt");
+    } finally {
+      b.close();
+    }
+  });
+
+  it("replays the same block once the hook recovers", async () => {
     const a = makePeer();
     const b = makeReceiverWithSpy();
     try {
@@ -353,14 +411,17 @@ describe("SyncRPC server — afterApply hook", () => {
       providerA.writeFileSync("/hi.txt", "hi");
 
       b.setAfterApply(() => {
-        throw new Error("settle blew up");
+        throw new Error("disk full");
       });
+      await expect(pushOnce(a.db, b.rpc)).rejects.toThrow("disk full");
 
-      // The push must still succeed — entries are committed before
-      // the hook runs, and the server logs+swallows hook errors.
+      // The retry replans the same block. Re-applying entries the
+      // receiver already holds is absorbed by alreadyApplied(), so the
+      // second attempt settles cleanly and advances the cursor.
+      b.setAfterApply(() => {});
       const pushed = await pushOnce(a.db, b.rpc);
-      expect(pushed).toBe(1);
-      expect(b.calls).toBe(1);
+      expect(pushed).toBeGreaterThan(0);
+      expect(b.calls).toBe(2);
       expect(fileEntries(b.db)).toContain("hi.txt");
     } finally {
       a.close();
@@ -465,6 +526,37 @@ describe("SyncRPC server — beforeFetch hook", () => {
       expect(fileEntries(a.db)).toContain("already-there.txt");
     } finally {
       a.close();
+      b.close();
+    }
+  });
+
+  it("settles before returning a deferred synchronization target", async () => {
+    const b = makeReceiverWithSpy();
+    try {
+      const provider = new SQLiteWorkspaceProvider(b.db, { now: () => 2 });
+      b.setBeforeFetch(() => {
+        provider.writeFileSync("/late.txt", "settled");
+      });
+
+      const watermarks = await b.rpc.watermarks({ settle: true });
+
+      expect(b.calls).toBe(1);
+      expect(watermarks.currentRev).toBe(currentRev(b.db));
+      expect(watermarks.currentRev).toBeGreaterThan(1);
+    } finally {
+      b.close();
+    }
+  });
+
+  it("surfaces a failed settle instead of returning a stale target", async () => {
+    const b = makeReceiverWithSpy();
+    try {
+      b.setBeforeFetch(() => {
+        throw new Error("settle failed");
+      });
+
+      await expect(b.rpc.watermarks({ settle: true })).rejects.toThrow("settle failed");
+    } finally {
       b.close();
     }
   });
@@ -1082,7 +1174,7 @@ describe("sync driver — blob-stage recovery", () => {
       source.mkdirSync("/repo/node_modules/tiny", { recursive: true });
       source.writeFileSync("/repo/package.json", '{"name":"fixture"}\n');
       source.writeFileSync("/repo/dist/result.txt", "installed");
-      source.writeFileSync("/repo/node_modules/tiny/index.js", "ignored");
+      source.writeFileSync("/repo/node_modules/tiny/index.js", "module.exports = 'installed';");
 
       let injected = false;
       const failingDb = new Database({
@@ -1109,7 +1201,9 @@ describe("sync driver — blob-stage recovery", () => {
       const destination = new SQLiteWorkspaceProvider(receiver.db, { now: () => 1 });
       expect(resumed.applied).toBeGreaterThan(0);
       expect(destination.readFileSync("/repo/dist/result.txt", "utf8")).toBe("installed");
-      expect(destination.existsSync("/repo/node_modules")).toBe(false);
+      expect(destination.readFileSync("/repo/node_modules/tiny/index.js", "utf8")).toBe(
+        "module.exports = 'installed';",
+      );
       expect(readFetchCursor(receiver.db)).toEqual({
         rev: currentRev(upstream.db),
         path: null,

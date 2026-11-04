@@ -14,7 +14,7 @@
   "dependencies": {
     "@cloudflare/computer": "*",
     "@earendil-works/pi-ai": "^0.99.2",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/dofs": "*",

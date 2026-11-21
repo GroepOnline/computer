@@ -73,7 +73,7 @@ jobs:
             # xz-utils extracts the target Node binary used by build:bin.
             system-deps: "libfuse2t64 fuse3 xz-utils"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 1
 
@@ -170,7 +170,7 @@ jobs:
             workspace: "@example/computer-worker-shell"
             path: examples/worker-shell
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 1
 
@@ -210,7 +210,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           filter: tree:0

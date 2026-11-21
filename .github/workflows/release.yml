@@ -47,7 +47,7 @@ jobs:
       # GHCR push uses GITHUB_TOKEN with `packages: write`.
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 1
 
@@ -113,7 +113,7 @@ jobs:
       - name: Create or update the Version Packages PR
         id: version-pr
         if: steps.pending-changesets.outputs.present == 'true'
-        uses: peter-evans/create-pull-request@v8
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8
         with:
           branch: release
           base: main
@@ -141,11 +141,11 @@ jobs:
       # Version Packages PR path should not need registry credentials.
       - name: Set up buildx
         if: steps.pending-changesets.outputs.present == 'false'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
         if: steps.pending-changesets.outputs.present == 'false'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -164,7 +164,7 @@ jobs:
 
       - id: changesets
         if: steps.pending-changesets.outputs.present == 'false'
-        uses: changesets/action@v1
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
         with:
           publish: node .github/changeset-publish.mjs
         env:
